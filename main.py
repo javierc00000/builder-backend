@@ -5,7 +5,7 @@ from typing import List, Dict, Any
 import re
 
 BACKEND_NAME = "builder-backend"
-BACKEND_VERSION = "auth-generator-v1"
+BACKEND_VERSION = "idea-orchestration-v1"
 
 app = FastAPI(title="Builder Backend - Auth System Generator")
 
@@ -77,6 +77,9 @@ class MutateRequest(BaseModel):
     systems: List[str] = Field(default_factory=list)
     complexity: str = "mvp"
     architecture: Dict[str, Any] = Field(default_factory=dict)
+    current_files: List[Dict[str, Any]] = Field(default_factory=list)
+    protected_systems: List[str] = Field(default_factory=list)
+    mutation_mode: str = "safe"
 
 
 class GenerateCodeRequest(BaseModel):
@@ -1308,6 +1311,144 @@ def generate_code_bundle(prompt: str, app_type: str, builder_mode: str, style: s
     return files
 
 
+# ---------- system-safe mutation helpers ----------
+def classify_mutation_scope(prompt: str, systems: List[str]) -> str:
+    p = prompt.lower()
+    if re.search(r"(color|theme|dark mode|light mode|spacing|font|ui|style|responsive|mobile)", p):
+        return "ui-only"
+    if re.search(r"(login|register|auth|account|session|protected route)", p):
+        return "auth-only"
+    if re.search(r"(database|storage|save|history|records|api|endpoint|crud)", p):
+        return "data-only"
+    if re.search(r"(route|page|navigation|sidebar|dashboard)", p):
+        return "navigation-and-pages"
+    if len(systems) > 2:
+        return "multi-system"
+    return "targeted"
+
+
+def detect_target_systems(prompt: str, fallback_systems: List[str]) -> List[str]:
+    p = prompt.lower()
+    targets: List[str] = []
+    checks = [
+        ("auth", r"(auth|login|register|account|user|session|protected)"),
+        ("storage", r"(storage|database|save|saved|history|records|crud|api|endpoint)"),
+        ("billing", r"(billing|stripe|subscription|paywall|plan|pricing)"),
+        ("ai-tools", r"(ai|scan|diagnostic|chat|assistant|vision|openai)"),
+        ("settings", r"(settings|profile|preferences)"),
+        ("dashboard", r"(dashboard|sidebar|navigation|layout|page|pages)"),
+    ]
+    for name, pattern in checks:
+        if re.search(pattern, p):
+            targets.append(name)
+    if re.search(r"(theme|dark mode|light mode|responsive|mobile|style|spacing|font|ui)", p):
+        targets.append("ui")
+    # keep targets that exist or are ui
+    final = []
+    for t in targets:
+        if t == "ui" or t in fallback_systems or t in {"dashboard", "settings", "auth", "storage", "billing", "ai-tools"}:
+            final.append(t)
+    return sorted(set(final)) or ["ui"]
+
+
+def build_preserve_rules(systems: List[str], target_systems: List[str], protected_systems: List[str]) -> Dict[str, Any]:
+    protected = sorted(set(protected_systems + [s for s in systems if s not in target_systems and s != "ui"]))
+    file_patterns = [
+        "frontend/src/lib/api.js",
+        "backend/main.py",
+        "README.md",
+        ".builder-meta.json",
+    ]
+    if "auth" in protected:
+        file_patterns += [
+            "frontend/src/lib/auth.js",
+            "frontend/src/components/ProtectedRoute.jsx",
+            "frontend/src/pages/LoginPage.jsx",
+            "frontend/src/pages/RegisterPage.jsx",
+            "backend/auth.py",
+        ]
+    if "storage" in protected:
+        file_patterns += [
+            "backend/data_store.py",
+            "backend/database.py",
+            "backend/supabase_schema.sql",
+            "frontend/src/lib/api.js",
+        ]
+    return {
+        "protected_systems": protected,
+        "preserve_file_patterns": sorted(set(file_patterns)),
+        "forbidden_operations": ["delete-protected-files", "rewrite-unrelated-systems", "drop-routes-without-replacement"],
+    }
+
+
+def build_safe_file_operations(prompt: str, app_type: str, target_systems: List[str], systems: List[str]) -> List[Dict[str, Any]]:
+    p = prompt.lower()
+    ops: List[Dict[str, Any]] = []
+    if "ui" in target_systems:
+        ops += [
+            {"type": "update", "path": "frontend/src/styles/app.css", "reason": "apply style-safe mutation", "system": "ui"},
+            {"type": "update", "path": "frontend/src/App.jsx", "reason": "adjust shell or routing wrappers without deleting core systems", "system": "ui"},
+        ]
+    if "auth" in target_systems:
+        ops += [
+            {"type": "update", "path": "frontend/src/lib/auth.js", "reason": "adjust auth client safely", "system": "auth"},
+            {"type": "update", "path": "frontend/src/components/ProtectedRoute.jsx", "reason": "preserve route protection while mutating auth", "system": "auth"},
+            {"type": "update", "path": "backend/auth.py", "reason": "mutate auth backend only", "system": "auth"},
+        ]
+    if "storage" in target_systems:
+        ops += [
+            {"type": "update", "path": "frontend/src/lib/api.js", "reason": "extend api client safely", "system": "storage"},
+            {"type": "update", "path": "backend/data_store.py", "reason": "preserve persistence while changing data flow", "system": "storage"},
+            {"type": "update", "path": "backend/main.py", "reason": "add or extend CRUD endpoints only", "system": "storage"},
+        ]
+    if "dashboard" in target_systems or re.search(r"(page|pages|sidebar|dashboard|navigation)", p):
+        page_path = {
+            "admin panel": "frontend/src/pages/DashboardPage.jsx",
+            "assistant app": "frontend/src/pages/AssistantPage.jsx",
+            "content app": "frontend/src/pages/StudioPage.jsx",
+            "tool app": "frontend/src/pages/ToolPage.jsx",
+        }.get(app_type, "frontend/src/pages/ToolPage.jsx")
+        ops += [
+            {"type": "update", "path": page_path, "reason": "mutate primary page without touching unrelated systems", "system": "dashboard"},
+            {"type": "update", "path": "frontend/src/App.jsx", "reason": "preserve routes while adding page-level changes", "system": "dashboard"},
+        ]
+    if "billing" in target_systems:
+        ops += [
+            {"type": "create_or_update", "path": "frontend/src/pages/BillingPage.jsx", "reason": "add billing ui safely", "system": "billing"},
+            {"type": "create_or_update", "path": "backend/billing.py", "reason": "add billing backend without touching auth or storage", "system": "billing"},
+        ]
+    if "ai-tools" in target_systems:
+        ops += [
+            {"type": "create_or_update", "path": "frontend/src/pages/ScanPage.jsx", "reason": "add ai feature surface safely", "system": "ai-tools"},
+            {"type": "create_or_update", "path": "backend/ai_tools.py", "reason": "isolate ai backend changes", "system": "ai-tools"},
+        ]
+    if not ops:
+        ops = [{"type": "update", "path": "frontend/src/App.jsx", "reason": "generic safe mutation fallback", "system": "ui"}]
+    return ops
+
+
+def build_mutation_guardrails(scope: str, target_systems: List[str], preserve_rules: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "mode": "system-safe",
+        "scope": scope,
+        "target_systems": target_systems,
+        "must_preserve": preserve_rules["preserve_file_patterns"],
+        "must_not_break": [
+            "existing routes remain reachable",
+            "auth flows remain intact unless auth is targeted",
+            "persistence layer remains compatible unless storage is targeted",
+            "api client contracts stay stable unless storage is targeted",
+        ],
+        "recommended_apply_order": [
+            "analyze-target-systems",
+            "lock-protected-files",
+            "patch-target-files",
+            "verify-routes",
+            "verify-auth-and-data-flow",
+        ],
+    }
+
+
 @app.post("/mutate")
 def mutate(payload: MutateRequest):
     prompt = payload.prompt.strip()
@@ -1376,3 +1517,390 @@ def generate_code(payload: GenerateCodeRequest):
         "app_file": "frontend/src/App.jsx",
         "summary": f"Generated {len(files)} files for a {app_type} in {builder_mode} mode with {', '.join(systems) if systems else 'base systems'} and {persistence} persistence.",
     }
+
+
+# ---------- idea-to-app orchestration ----------
+from uuid import uuid4
+from datetime import datetime
+
+
+class OrchestrateRequest(BaseModel):
+    prompt: str
+    project_id: str = ""
+    mode: str = "auto"  # auto | create | update
+    current_files: List[Dict[str, Any]] = Field(default_factory=list)
+    systems: List[str] = Field(default_factory=list)
+    complexity: str = "mvp"
+    style: str = "dark glass"
+    architecture: Dict[str, Any] = Field(default_factory=dict)
+    app_type: str = ""
+    builder_mode: str = ""
+    persistence: str = ""
+    routes: List[Dict[str, Any]] = Field(default_factory=list)
+    components: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+PROJECT_STORE: Dict[str, Dict[str, Any]] = {}
+
+
+def now_iso() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+
+def normalize_file_list(files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    cleaned: List[Dict[str, Any]] = []
+    seen = set()
+    for item in files or []:
+        path = str(item.get("path", "")).strip()
+        if not path:
+            continue
+        key = path.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(
+            {
+                "path": path,
+                "language": item.get("language", infer_language_from_path(path)),
+                "content": item.get("content", ""),
+            }
+        )
+    return cleaned
+
+
+def infer_language_from_path(path: str) -> str:
+    lower = path.lower()
+    if lower.endswith(".py"):
+        return "python"
+    if lower.endswith(".jsx") or lower.endswith(".js"):
+        return "javascript"
+    if lower.endswith(".css"):
+        return "css"
+    if lower.endswith(".json"):
+        return "json"
+    if lower.endswith(".md"):
+        return "markdown"
+    if lower.endswith(".html"):
+        return "html"
+    if lower.endswith(".sql"):
+        return "sql"
+    return "text"
+
+
+def infer_complexity(prompt: str, requested: str = "") -> str:
+    value = (requested or "").strip().lower()
+    if value in {"starter", "mvp", "product"}:
+        return value
+    p = prompt.lower()
+    if re.search(r"(complete app|full app|production|product|saas|portal|platform|multi page|multi-page)", p):
+        return "product"
+    if re.search(r"(prototype|starter|simple app|simple tool|quick demo)", p):
+        return "starter"
+    return "mvp"
+
+
+def default_architecture(app_type: str, systems: List[str], persistence: str) -> Dict[str, Any]:
+    frontend = "react-vite"
+    backend = "fastapi"
+    state = "local project state"
+    auth = "jwt" if "auth" in systems else "none"
+    if persistence == "supabase":
+        state = "supabase"
+        auth = "supabase+jwt" if "auth" in systems else "supabase"
+    elif persistence == "sqlite":
+        state = "sqlite+api"
+    elif persistence == "localstorage":
+        state = "localstorage"
+    return {
+        "frontend": frontend,
+        "backend": backend,
+        "state": state,
+        "auth": auth,
+        "app_shell": app_type,
+    }
+
+
+def choose_orchestration_mode(requested_mode: str, project_id: str, existing: Dict[str, Any]) -> str:
+    mode = (requested_mode or "auto").strip().lower()
+    if mode in {"create", "update"}:
+        return mode
+    if project_id and existing:
+        return "update"
+    return "create"
+
+
+def merge_architecture(existing: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(existing or {})
+    for key, value in (incoming or {}).items():
+        if value not in ("", None, [], {}):
+            merged[key] = value
+    return merged
+
+
+def make_project_name(prompt: str, app_type: str) -> str:
+    text = re.sub(r"[^a-zA-Z0-9\s-]", "", prompt).strip()
+    parts = [p for p in text.split() if p][:6]
+    if not parts:
+        parts = app_type.split()
+    return " ".join(word.capitalize() for word in parts)[:60] or "Generated App"
+
+
+def slugify_name(name: str) -> str:
+    value = re.sub(r"[^a-zA-Z0-9]+", "-", name.strip().lower()).strip("-")
+    return value or "generated-app"
+
+
+def build_preview_model(app_type: str, systems: List[str], routes: List[Dict[str, Any]], files: List[Dict[str, Any]]) -> Dict[str, Any]:
+    page_paths = [r.get("path", "/") for r in routes]
+    key_files = [f.get("path", "") for f in files[:12]]
+    return {
+        "shell": app_type,
+        "routes": page_paths,
+        "systems": systems,
+        "key_files": key_files,
+        "preview_ready": True,
+    }
+
+
+def build_project_state_record(
+    *,
+    project_id: str,
+    prompt: str,
+    mode: str,
+    app_type: str,
+    builder_mode: str,
+    systems: List[str],
+    complexity: str,
+    persistence: str,
+    style: str,
+    architecture: Dict[str, Any],
+    routes: List[Dict[str, Any]],
+    components: List[Dict[str, Any]],
+    files: List[Dict[str, Any]],
+    previous_versions: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    project_name = make_project_name(prompt, app_type)
+    return {
+        "project_id": project_id,
+        "project_name": project_name,
+        "project_slug": slugify_name(project_name),
+        "prompt": prompt,
+        "mode": mode,
+        "app_type": app_type,
+        "builder_mode": builder_mode,
+        "systems": systems,
+        "complexity": complexity,
+        "persistence": persistence,
+        "style": style,
+        "architecture": architecture,
+        "routes": routes,
+        "components": components,
+        "files": files,
+        "preview": build_preview_model(app_type, systems, routes, files),
+        "version_count": len(previous_versions) + 1,
+        "updated_at": now_iso(),
+        "versions": previous_versions + [
+            {
+                "version": len(previous_versions) + 1,
+                "prompt": prompt,
+                "updated_at": now_iso(),
+                "file_count": len(files),
+                "systems": list(systems),
+            }
+        ],
+    }
+
+
+def extend_project_from_prompt(base_project: Dict[str, Any], prompt: str) -> Dict[str, Any]:
+    existing_systems = list(base_project.get("systems", []))
+    app_type = base_project.get("app_type") or infer_app_type(prompt)
+    builder_mode = base_project.get("builder_mode") or infer_builder_mode(prompt)
+    extra_systems = infer_systems(prompt, app_type, existing_systems)
+    systems = sorted(set(existing_systems + extra_systems))
+    complexity = infer_complexity(prompt, base_project.get("complexity", "mvp"))
+    persistence = infer_persistence(prompt, systems, complexity, base_project.get("persistence", ""))
+    style = base_project.get("style", "dark glass")
+    architecture = default_architecture(app_type, systems, persistence)
+    architecture = merge_architecture(architecture, base_project.get("architecture", {}))
+    routes = build_routes(app_type, prompt, systems)
+    components = build_components(app_type, systems)
+    files = generate_code_bundle(prompt, app_type, builder_mode, style, systems, persistence, complexity)
+    return {
+        "app_type": app_type,
+        "builder_mode": builder_mode,
+        "systems": systems,
+        "complexity": complexity,
+        "persistence": persistence,
+        "style": style,
+        "architecture": architecture,
+        "routes": routes,
+        "components": components,
+        "files": normalize_file_list(files),
+    }
+
+
+def create_project_from_idea(payload: OrchestrateRequest) -> Dict[str, Any]:
+    prompt = payload.prompt.strip()
+    app_type = payload.app_type or infer_app_type(prompt)
+    builder_mode = payload.builder_mode or infer_builder_mode(prompt)
+    systems = infer_systems(prompt, app_type, payload.systems)
+    complexity = infer_complexity(prompt, payload.complexity)
+    persistence = infer_persistence(prompt, systems, complexity, payload.persistence)
+    style = payload.style or "dark glass"
+    architecture = default_architecture(app_type, systems, persistence)
+    architecture = merge_architecture(architecture, payload.architecture)
+    routes = payload.routes or build_routes(app_type, prompt, systems)
+    components = payload.components or build_components(app_type, systems)
+    files = payload.current_files or generate_code_bundle(prompt, app_type, builder_mode, style, systems, persistence, complexity)
+    files = normalize_file_list(files)
+    project_id = payload.project_id or str(uuid4())
+    return build_project_state_record(
+        project_id=project_id,
+        prompt=prompt,
+        mode="create",
+        app_type=app_type,
+        builder_mode=builder_mode,
+        systems=systems,
+        complexity=complexity,
+        persistence=persistence,
+        style=style,
+        architecture=architecture,
+        routes=routes,
+        components=components,
+        files=files,
+        previous_versions=[],
+    )
+
+
+def update_existing_project(project: Dict[str, Any], payload: OrchestrateRequest) -> Dict[str, Any]:
+    prompt = payload.prompt.strip()
+    extended = extend_project_from_prompt(project, prompt)
+    architecture = merge_architecture(extended["architecture"], payload.architecture)
+    return build_project_state_record(
+        project_id=project["project_id"],
+        prompt=prompt,
+        mode="update",
+        app_type=extended["app_type"],
+        builder_mode=extended["builder_mode"],
+        systems=extended["systems"],
+        complexity=extended["complexity"],
+        persistence=extended["persistence"],
+        style=extended["style"],
+        architecture=architecture,
+        routes=payload.routes or extended["routes"],
+        components=payload.components or extended["components"],
+        files=payload.current_files or extended["files"],
+        previous_versions=project.get("versions", []),
+    )
+
+
+@app.post("/orchestrate")
+def orchestrate(payload: OrchestrateRequest):
+    prompt = payload.prompt.strip()
+    existing = PROJECT_STORE.get(payload.project_id, {}) if payload.project_id else {}
+    mode = choose_orchestration_mode(payload.mode, payload.project_id, existing)
+
+    if mode == "create":
+        project = create_project_from_idea(payload)
+    else:
+        if not existing:
+            project = create_project_from_idea(payload)
+            mode = "create"
+        else:
+            project = update_existing_project(existing, payload)
+
+    PROJECT_STORE[project["project_id"]] = project
+
+    orchestration_summary = [
+        f"Mode: {mode}",
+        f"App type: {project['app_type']}",
+        f"Builder mode: {project['builder_mode']}",
+        f"Systems: {', '.join(project['systems']) or 'none'}",
+        f"Persistence: {project['persistence']}",
+        f"Complexity: {project['complexity']}",
+        f"Files ready: {len(project['files'])}",
+        f"Project versions: {project['version_count']}",
+    ]
+
+    return {
+        "ok": True,
+        "project_id": project["project_id"],
+        "project_name": project["project_name"],
+        "project_slug": project["project_slug"],
+        "mode": mode,
+        "prompt": prompt,
+        "app_type": project["app_type"],
+        "builder_mode": project["builder_mode"],
+        "systems": project["systems"],
+        "complexity": project["complexity"],
+        "persistence": project["persistence"],
+        "style": project["style"],
+        "architecture": project["architecture"],
+        "routes": project["routes"],
+        "components": project["components"],
+        "files": project["files"],
+        "generated_files": project["files"],
+        "entry_file": "frontend/src/main.jsx",
+        "app_file": "frontend/src/App.jsx",
+        "preview": project["preview"],
+        "project_state": {
+            "project_id": project["project_id"],
+            "version_count": project["version_count"],
+            "updated_at": project["updated_at"],
+            "systems": project["systems"],
+            "persistence": project["persistence"],
+        },
+        "orchestration_summary": orchestration_summary,
+        "next_best_actions": [
+            "preview current app",
+            "apply focused mutation",
+            "download project zip",
+            "add deploy configuration",
+        ],
+    }
+
+
+@app.get("/project-state/{project_id}")
+def project_state(project_id: str):
+    project = PROJECT_STORE.get(project_id)
+    if not project:
+        return {"ok": False, "error": "project_not_found", "project_id": project_id}
+    return {
+        "ok": True,
+        "project_id": project["project_id"],
+        "project_name": project["project_name"],
+        "project_slug": project["project_slug"],
+        "app_type": project["app_type"],
+        "builder_mode": project["builder_mode"],
+        "systems": project["systems"],
+        "complexity": project["complexity"],
+        "persistence": project["persistence"],
+        "style": project["style"],
+        "architecture": project["architecture"],
+        "routes": project["routes"],
+        "components": project["components"],
+        "files": project["files"],
+        "preview": project["preview"],
+        "versions": project["versions"],
+        "updated_at": project["updated_at"],
+    }
+
+
+@app.get("/projects")
+def list_projects():
+    items = []
+    for project in PROJECT_STORE.values():
+        items.append(
+            {
+                "project_id": project["project_id"],
+                "project_name": project["project_name"],
+                "project_slug": project["project_slug"],
+                "app_type": project["app_type"],
+                "systems": project["systems"],
+                "persistence": project["persistence"],
+                "version_count": project["version_count"],
+                "updated_at": project["updated_at"],
+            }
+        )
+    items.sort(key=lambda item: item["updated_at"], reverse=True)
+    return {"ok": True, "count": len(items), "projects": items}
