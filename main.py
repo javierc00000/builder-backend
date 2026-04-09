@@ -1,13 +1,14 @@
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import re
+import json
+import time
+import uuid
 
-BACKEND_NAME = "builder-backend"
-BACKEND_VERSION = "idea-orchestration-v1"
-
-app = FastAPI(title="Builder Backend - Auth System Generator")
+app = FastAPI(title="Builder Backend v6 - Data Flow Generator")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,20 +25,12 @@ app.add_middleware(
 
 @app.get("/")
 def home():
-    return {
-        "status": "ok",
-        "service": BACKEND_NAME,
-        "version": BACKEND_VERSION,
-    }
+    return {"status": "ok", "service": "builder-backend-v6"}
 
 
 @app.get("/health")
 def health():
-    return {
-        "status": "healthy",
-        "service": BACKEND_NAME,
-        "version": BACKEND_VERSION,
-    }
+    return {"status": "healthy", "service": "builder-backend-v6", "data_flow": True}
 
 
 class ApplianceItem(BaseModel):
@@ -52,6 +45,49 @@ class BatteryPlanRequest(BaseModel):
     autonomy_days: float = 1
     sun_hours: float = 4
     system_loss: float = 0.2
+
+
+class MutateRequest(BaseModel):
+    prompt: str
+    current_layout: Dict[str, Any] = Field(default_factory=dict)
+    active_modules: List[str] = Field(default_factory=list)
+    feature_state: Dict[str, Any] = Field(default_factory=dict)
+    systems: List[str] = Field(default_factory=list)
+    complexity: str = ""
+    architecture: Dict[str, Any] = Field(default_factory=dict)
+
+
+class GenerateCodeRequest(BaseModel):
+    prompt: str
+    app_type: str = ""
+    builder_mode: str = ""
+    style: str = "dark glass"
+    routes: List[Dict[str, Any]] = Field(default_factory=list)
+    components: List[Dict[str, Any]] = Field(default_factory=list)
+    systems: List[str] = Field(default_factory=list)
+    complexity: str = "mvp"
+    architecture: Dict[str, Any] = Field(default_factory=dict)
+    persistence: str = ""
+
+class PreviewRunRequest(BaseModel):
+    files: List[Dict[str, Any]] = Field(default_factory=list)
+    prompt: str = ""
+    app_type: str = ""
+    builder_mode: str = ""
+    route: str = "/"
+    auth_mode: str = "guest"
+    routes: List[Dict[str, Any]] = Field(default_factory=list)
+    components: List[Dict[str, Any]] = Field(default_factory=list)
+    systems: List[str] = Field(default_factory=list)
+    project_id: Optional[str] = None
+    session_id: Optional[str] = None
+
+
+class PreviewResetRequest(BaseModel):
+    session_id: str
+
+
+_PREVIEW_SESSIONS: Dict[str, Dict[str, Any]] = {}
 
 
 @app.post("/battery-plan")
@@ -69,33 +105,6 @@ def battery_plan(payload: BatteryPlanRequest):
     }
 
 
-class MutateRequest(BaseModel):
-    prompt: str
-    current_layout: Dict[str, Any] = Field(default_factory=dict)
-    active_modules: List[str] = Field(default_factory=list)
-    feature_state: Dict[str, Any] = Field(default_factory=dict)
-    systems: List[str] = Field(default_factory=list)
-    complexity: str = "mvp"
-    architecture: Dict[str, Any] = Field(default_factory=dict)
-    current_files: List[Dict[str, Any]] = Field(default_factory=list)
-    protected_systems: List[str] = Field(default_factory=list)
-    mutation_mode: str = "safe"
-
-
-class GenerateCodeRequest(BaseModel):
-    prompt: str
-    app_type: str = ""
-    builder_mode: str = ""
-    style: str = "dark glass"
-    routes: List[Dict[str, Any]] = Field(default_factory=list)
-    components: List[Dict[str, Any]] = Field(default_factory=list)
-    systems: List[str] = Field(default_factory=list)
-    complexity: str = "mvp"
-    architecture: Dict[str, Any] = Field(default_factory=dict)
-    persistence: str = ""
-
-
-# ---------- inference ----------
 def infer_app_type(prompt: str) -> str:
     p = prompt.lower()
     if re.search(r"(admin|dashboard|crm|analytics|panel|saas)", p):
@@ -129,45 +138,43 @@ def infer_summary_style(prompt: str) -> str:
     return "balanced"
 
 
-def infer_systems(prompt: str, app_type: str, requested: List[str]) -> List[str]:
-    detected = set(s.lower() for s in requested)
+def infer_systems(prompt: str, app_type: str) -> List[str]:
     p = prompt.lower()
-
-    if app_type in {"admin panel", "assistant app", "content app", "tool app"}:
-        detected.add("dashboard")
-
-    if re.search(r"(auth|login|register|signin|sign in|signup|sign up|account|user)", p):
-        detected.add("auth")
-    if re.search(r"(save|saved|history|database|db|records|storage|folders|reports)", p):
-        detected.add("storage")
-    if re.search(r"(billing|stripe|subscription|paywall|pro plan|membership)", p):
-        detected.add("billing")
-    if re.search(r"(ai|scan|diagnostic|chat|assistant|vision|openai)", p):
-        detected.add("ai-tools")
-    if re.search(r"(settings|profile|preferences)", p):
-        detected.add("settings")
-
+    systems = set()
     if app_type == "admin panel":
-        detected.update({"dashboard", "settings"})
-    if app_type == "assistant app":
-        detected.update({"ai-tools", "settings"})
+        systems.update(["dashboard", "storage", "settings"])
+    elif app_type == "assistant app":
+        systems.update(["ai-tools", "storage", "settings"])
+    elif app_type == "content app":
+        systems.update(["storage", "settings"])
+    else:
+        systems.update(["storage"])
 
-    return sorted(detected)
+    if re.search(r"(login|auth|account|signin|sign in|register|user)", p):
+        systems.add("auth")
+    if re.search(r"(billing|subscription|stripe|paywall|pro|premium)", p):
+        systems.add("billing")
+    if re.search(r"(scan|diagnostic|ai|assistant|chat|analysis)", p):
+        systems.add("ai-tools")
+    if re.search(r"(admin|team|portal|role|dealer|tech)", p):
+        systems.add("admin")
+    if re.search(r"(settings|preferences|profile)", p):
+        systems.add("settings")
+    if re.search(r"(dashboard|stats|analytics|reports)", p):
+        systems.add("dashboard")
+    return sorted(systems)
 
 
-def infer_persistence(prompt: str, systems: List[str], complexity: str, explicit: str) -> str:
-    if explicit:
-        return explicit.lower()
+def infer_persistence(prompt: str, systems: List[str], complexity: str) -> str:
     p = prompt.lower()
-    if "billing" in systems or re.search(r"(supabase|cloud|multi-user|saas)", p):
+    if "billing" in systems or "auth" in systems or complexity == "product":
         return "supabase"
-    if "auth" in systems or "storage" in systems or complexity.lower() in {"mvp", "product"}:
+    if re.search(r"(local|offline|desktop|mvp|sqlite|history|saved)", p) or complexity == "mvp":
         return "sqlite"
     return "localstorage"
 
 
-# ---------- layout / mutate helpers ----------
-def recommend_modules(prompt: str, app_type: str, systems: List[str]) -> List[str]:
+def recommend_modules(prompt: str, app_type: str) -> List[str]:
     p = prompt.lower()
     modules = {
         "results_summary",
@@ -179,22 +186,22 @@ def recommend_modules(prompt: str, app_type: str, systems: List[str]) -> List[st
     }
     if app_type == "admin panel":
         modules.update({"dashboard_shell", "sidebar_navigation", "split_workspace"})
-    if app_type == "assistant app":
-        modules.update({"split_workspace", "notes_panel"})
-    if app_type == "content app":
-        modules.update({"notes_panel", "split_workspace"})
-    if app_type == "tool app":
-        modules.update({"split_workspace"})
+    if app_type in {"assistant app", "content app", "tool app"}:
+        modules.add("split_workspace")
+    if app_type in {"assistant app", "content app"}:
+        modules.add("notes_panel")
     if re.search(r"(battery|solar|power|calculator|tool)", p):
         modules.add("calculator_engine")
-    if "auth" in systems:
-        modules.add("auth_guard")
-    if "storage" in systems:
-        modules.add("data_manager")
-    if "billing" in systems:
-        modules.add("billing_panel")
-    if "ai-tools" in systems:
-        modules.add("ai_toolrail")
+    if re.search(r"(affiliate|amazon|monetize|shop)", p):
+        modules.add("affiliate_suggestions")
+    if re.search(r"(export|report|download|pdf)", p):
+        modules.add("export_report")
+    if re.search(r"(sidebar|navigation|rail)", p):
+        modules.add("sidebar_navigation")
+    if re.search(r"(notes|brainstorm|scratch)", p):
+        modules.add("notes_panel")
+    if re.search(r"(dashboard|crm|saas)", p):
+        modules.add("dashboard_shell")
     return sorted(modules)
 
 
@@ -209,25 +216,30 @@ def build_layout(prompt: str, current_layout: Dict[str, Any]) -> Dict[str, Any]:
         "cards": current_layout.get("cards", True),
         "dense": current_layout.get("dense", False),
         "previewStyle": current_layout.get("previewStyle", "wireframe"),
+        "panels": {
+            "sidebar": list(current_layout.get("panels", {}).get("sidebar", ["builder", "results", "modules", "mutations"])),
+            "mainTop": list(current_layout.get("panels", {}).get("mainTop", ["brain", "command", "quickActions"])),
+            "mainBottom": list(current_layout.get("panels", {}).get("mainBottom", ["planner", "results", "preview"])),
+            "inspector": list(current_layout.get("panels", {}).get("inspector", ["status", "affiliate", "notes"])),
+        },
     }
     p = prompt.lower()
     if re.search(r"(dashboard|crm|saas)", p):
-        layout.update({
-            "mode": "dashboard",
-            "shell": "dashboard",
-            "sidebar": True,
-            "split": True,
-            "inspector": True,
-            "previewStyle": "dashboard",
-        })
-    if re.search(r"(assistant|copilot|agent|chat)", p):
-        layout.update({"split": True, "inspector": True})
-    if re.search(r"(content|editor|writer|studio)", p):
-        layout.update({"split": True, "inspector": True})
+        layout.update({"mode": "dashboard", "shell": "dashboard", "sidebar": True, "split": True, "inspector": True, "previewStyle": "dashboard"})
+    if re.search(r"(assistant|copilot|agent|content|editor|writer|studio)", p):
+        layout.update({"mode": "workspace", "shell": "classic", "split": True, "inspector": True})
+    if re.search(r"(focus preview|preview first|canvas focus)", p):
+        layout.update({"mode": "focus", "shell": "focus", "split": True, "previewStyle": "spotlight"})
     if re.search(r"(dense|compact)", p):
         layout["dense"] = True
     if re.search(r"(spacious|comfortable|relaxed)", p):
         layout["dense"] = False
+    if re.search(r"(add sidebar|sidebar|navigation)", p):
+        layout["sidebar"] = True
+    if re.search(r"(add inspector|inspector|right panel)", p):
+        layout["inspector"] = True
+    if re.search(r"(split|two column|2 column|2-column)", p):
+        layout["split"] = True
     return layout
 
 
@@ -239,25 +251,53 @@ def build_file_tree(app_type: str, builder_mode: str, prompt: str, systems: List
         {"path": "frontend/src/components", "kind": "folder", "role": "ui components"},
         {"path": "frontend/src/pages", "kind": "folder", "role": "pages"},
         {"path": "frontend/src/lib", "kind": "folder", "role": "helpers"},
-        {"path": "backend/main.py", "kind": "file", "role": "generated backend"},
+        {"path": "backend/main.py", "kind": "file", "role": "api server"},
+        {"path": "backend/requirements.txt", "kind": "file", "role": "backend deps"},
     ]
+    if app_type == "admin panel":
+        base += [
+            {"path": "frontend/src/pages/DashboardPage.jsx", "kind": "file", "role": "dashboard page"},
+            {"path": "frontend/src/components/Sidebar.jsx", "kind": "file", "role": "navigation"},
+            {"path": "frontend/src/components/KpiCard.jsx", "kind": "file", "role": "metrics card"},
+            {"path": "frontend/src/components/InspectorPanel.jsx", "kind": "file", "role": "details panel"},
+        ]
+    elif app_type == "assistant app":
+        base += [
+            {"path": "frontend/src/pages/AssistantPage.jsx", "kind": "file", "role": "assistant page"},
+            {"path": "frontend/src/components/ChatShell.jsx", "kind": "file", "role": "chat interface"},
+            {"path": "frontend/src/components/ToolRail.jsx", "kind": "file", "role": "tools rail"},
+            {"path": "frontend/src/components/MemoryPanel.jsx", "kind": "file", "role": "memory / notes"},
+        ]
+    elif app_type == "content app":
+        base += [
+            {"path": "frontend/src/pages/StudioPage.jsx", "kind": "file", "role": "content studio"},
+            {"path": "frontend/src/components/EditorShell.jsx", "kind": "file", "role": "editor"},
+            {"path": "frontend/src/components/PreviewPanel.jsx", "kind": "file", "role": "content preview"},
+            {"path": "frontend/src/components/NotesPanel.jsx", "kind": "file", "role": "notes"},
+        ]
+    else:
+        base += [
+            {"path": "frontend/src/pages/ToolPage.jsx", "kind": "file", "role": "tool page"},
+            {"path": "frontend/src/components/CalculatorForm.jsx", "kind": "file", "role": "tool input"},
+            {"path": "frontend/src/components/ResultsPanel.jsx", "kind": "file", "role": "tool output"},
+            {"path": "frontend/src/components/ExportActions.jsx", "kind": "file", "role": "export controls"},
+        ]
     if "auth" in systems:
         base += [
-            {"path": "frontend/src/pages/LoginPage.jsx", "kind": "file", "role": "login page"},
-            {"path": "frontend/src/pages/RegisterPage.jsx", "kind": "file", "role": "register page"},
-            {"path": "frontend/src/lib/auth.js", "kind": "file", "role": "auth client"},
-            {"path": "frontend/src/components/ProtectedRoute.jsx", "kind": "file", "role": "route protection"},
-            {"path": "backend/auth.py", "kind": "file", "role": "auth api"},
+            {"path": "frontend/src/pages/LoginPage.jsx", "kind": "file", "role": "authentication"},
+            {"path": "frontend/src/lib/auth.js", "kind": "file", "role": "auth helpers"},
         ]
-    if persistence == "sqlite":
+    if "storage" in systems:
         base += [
-            {"path": "backend/database.py", "kind": "file", "role": "sqlite helpers"},
-            {"path": "backend/data_store.py", "kind": "file", "role": "storage layer"},
+            {"path": "frontend/src/lib/api.js", "kind": "file", "role": "api client"},
+            {"path": "frontend/src/hooks/useItems.js", "kind": "file", "role": "data hook"},
+            {"path": "backend/data_store.py", "kind": "file", "role": f"{persistence} storage layer"},
         ]
-    if persistence == "supabase":
-        base += [{"path": "backend/supabase_schema.sql", "kind": "file", "role": "cloud schema"}]
     if builder_mode == "battery-planner":
-        base += [{"path": "frontend/src/lib/batteryMath.js", "kind": "file", "role": "calculation logic"}]
+        base += [
+            {"path": "frontend/src/lib/batteryMath.js", "kind": "file", "role": "calculation logic"},
+            {"path": "frontend/src/components/ApplianceTable.jsx", "kind": "file", "role": "appliance rows"},
+        ]
     return base
 
 
@@ -284,10 +324,7 @@ def build_routes(app_type: str, prompt: str, systems: List[str]) -> List[Dict[st
             {"path": "/results", "component": "ResultsPage", "reason": "output view"},
         ]
     if "auth" in systems:
-        routes += [
-            {"path": "/login", "component": "LoginPage", "reason": "auth entry"},
-            {"path": "/register", "component": "RegisterPage", "reason": "account creation"},
-        ]
+        routes.append({"path": "/login", "component": "LoginPage", "reason": "auth entry"})
     return routes
 
 
@@ -321,8 +358,10 @@ def build_components(app_type: str, systems: List[str]) -> List[Dict[str, str]]:
             {"name": "ResultsPanel", "purpose": "tool outputs"},
             {"name": "ExportActions", "purpose": "download/export actions"},
         ]
+    if "storage" in systems:
+        base.append({"name": "DataList", "purpose": "renders persisted records"})
     if "auth" in systems:
-        base.append({"name": "ProtectedRoute", "purpose": "protect private routes"})
+        base.append({"name": "AuthGate", "purpose": "guards protected screens"})
     return base
 
 
@@ -333,7 +372,7 @@ def build_mutation_summary(layout: Dict[str, Any], modules: List[str], app_type:
         f"Layout shell: {layout['shell']}",
         f"Preview style: {layout['previewStyle']}",
         f"Active modules planned: {len(modules)}",
-        f"Systems planned: {', '.join(systems) if systems else 'base only'}",
+        f"Systems planned: {', '.join(systems) if systems else 'none'}",
         f"Persistence planned: {persistence}",
     ]
     if layout.get("sidebar"):
@@ -345,7 +384,6 @@ def build_mutation_summary(layout: Dict[str, Any], modules: List[str], app_type:
     return summary
 
 
-# ---------- shared generated frontend ----------
 def app_css(style_name: str) -> str:
     return """
 :root {
@@ -365,376 +403,449 @@ body {
   background: radial-gradient(circle at top, #12203a, #07111f 55%);
   color: var(--text);
 }
-a { color: inherit; text-decoration: none; }
 button, input, textarea { font: inherit; }
 .app-shell { min-height: 100vh; padding: 24px; display: grid; gap: 18px; }
 .panel { border: 1px solid var(--panel-border); background: var(--panel); border-radius: 20px; padding: 18px; }
 .row { display: grid; gap: 18px; }
 .row.two { grid-template-columns: 260px 1fr; }
+.row.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.pill { display: inline-flex; align-items: center; gap: 8px; border-radius: 999px; padding: 8px 12px; border: 1px solid rgba(148, 163, 184, 0.18); background: rgba(255,255,255,0.04); color: var(--muted); }
+.primary-btn { border: none; border-radius: 999px; padding: 12px 18px; font-weight: 700; cursor: pointer; background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: #07111f; }
+.muted { color: var(--muted); }
 .card-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
 .card { border: 1px solid rgba(148,163,184,.14); border-radius: 16px; padding: 16px; background: rgba(255,255,255,0.03); }
 .input { width: 100%; border-radius: 14px; border: 1px solid rgba(148,163,184,.16); background: rgba(255,255,255,.04); color: var(--text); padding: 12px 14px; }
-.primary-btn { border: none; border-radius: 999px; padding: 12px 18px; font-weight: 700; cursor: pointer; background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: #07111f; }
-.secondary-btn { border: 1px solid rgba(148,163,184,.2); border-radius: 999px; padding: 12px 18px; cursor: pointer; background: rgba(255,255,255,.05); color: var(--text); }
-.pill { display: inline-flex; align-items: center; gap: 8px; border-radius: 999px; padding: 8px 12px; border: 1px solid rgba(148, 163, 184, 0.18); background: rgba(255,255,255,0.04); color: var(--muted); }
-.muted { color: var(--muted); }
-@media (max-width: 900px) { .row.two { grid-template-columns: 1fr; } }
+.list { display: grid; gap: 10px; margin-top: 12px; }
+.item { display: flex; justify-content: space-between; gap: 12px; padding: 12px; border: 1px solid rgba(148,163,184,.12); border-radius: 12px; background: rgba(255,255,255,.03); }
+@media (max-width: 900px) { .row.two, .row.three { grid-template-columns: 1fr; } }
 """.strip()
 
 
 def main_jsx() -> str:
     return """
-import React from "react";
-import ReactDOM from "react-dom/client";
-import { BrowserRouter } from "react-router-dom";
-import App from "./App.jsx";
-import "./styles/app.css";
+import React from \"react\";
+import ReactDOM from \"react-dom/client\";
+import App from \"./App.jsx\";
+import \"./styles/app.css\";
 
-ReactDOM.createRoot(document.getElementById("root")).render(
+ReactDOM.createRoot(document.getElementById(\"root\")).render(
   <React.StrictMode>
-    <BrowserRouter>
-      <App />
-    </BrowserRouter>
+    <App />
   </React.StrictMode>
 );
 """.strip()
 
 
-def app_router_code(app_type: str, systems: List[str]) -> str:
-    main_page = {
+def root_app_code(app_type: str) -> str:
+    page_name = {
         "admin panel": "DashboardPage",
         "assistant app": "AssistantPage",
         "content app": "StudioPage",
         "tool app": "ToolPage",
     }.get(app_type, "ToolPage")
-    imports = [f'import {{ {main_page} }} from "./pages/{main_page}.jsx";']
-    routes = [f'<Route path="/" element={{<{main_page} />}} />']
-
-    if "auth" in systems:
-        imports += [
-            'import { LoginPage } from "./pages/LoginPage.jsx";',
-            'import { RegisterPage } from "./pages/RegisterPage.jsx";',
-            'import { ProtectedRoute } from "./components/ProtectedRoute.jsx";',
-            'import { AuthProvider } from "./lib/auth.js";',
-        ]
-        protected_root = f'<Route path="/app" element={{<ProtectedRoute><{main_page} /></ProtectedRoute>}} />'
-        routes = [protected_root] + routes + [
-            '<Route path="/login" element={<LoginPage />} />',
-            '<Route path="/register" element={<RegisterPage />} />',
-        ]
-        provider_open = '<AuthProvider>'
-        provider_close = '</AuthProvider>'
-    else:
-        provider_open = ''
-        provider_close = ''
-
-    imports_block = "\n".join(imports)
-    routes_block = "\n        ".join(routes)
-    return f'''
-import React from "react";
-import {{ Routes, Route }} from "react-router-dom";
-{imports_block}
+    return f"""
+import React from \"react\";
+import {{ {page_name} }} from \"./pages/{page_name}.jsx\";
 
 export default function App() {{
-  return (
-    {provider_open}
-      <Routes>
-        {routes_block}
-      </Routes>
-    {provider_close}
-  );
+  return <{page_name} />;
 }}
-'''.strip()
+""".strip()
 
 
 def dashboard_page_code(prompt: str) -> str:
-    return f'''
-import React from "react";
+    return f"""
+import React, {{ useEffect, useState }} from \"react\";
+import {{ Sidebar }} from \"../components/Sidebar.jsx\";
+import {{ KpiCard }} from \"../components/KpiCard.jsx\";
+import {{ InspectorPanel }} from \"../components/InspectorPanel.jsx\";
+import {{ getItems }} from \"../lib/api.js\";
 
 export function DashboardPage() {{
+  const [items, setItems] = useState([]);
+  useEffect(() => {{ getItems().then(setItems).catch(() => setItems([])); }}, []);
+
   return (
-    <div className="app-shell">
-      <section className="panel">
-        <div className="pill">Dashboard</div>
-        <h1>Product Dashboard</h1>
-        <p className="muted">{prompt}</p>
-      </section>
-      <section className="card-grid">
-        <div className="card"><h3>Users</h3><p className="muted">Connected system area</p></div>
-        <div className="card"><h3>Saved Data</h3><p className="muted">Persistence-ready workspace</p></div>
-        <div className="card"><h3>AI Tools</h3><p className="muted">Generated modules can plug in here</p></div>
-      </section>
+    <div className=\"app-shell\">
+      <div className=\"panel\">
+        <div className=\"pill\">Admin dashboard</div>
+        <h1>CRM Dashboard</h1>
+        <p className=\"muted\">{prompt}</p>
+      </div>
+      <div className=\"row two\">
+        <Sidebar />
+        <div className=\"row\">
+          <div className=\"card-grid\">
+            <KpiCard title=\"Records\" value={{String(items.length)}} />
+            <KpiCard title=\"Status\" value=\"Connected\" />
+            <KpiCard title=\"Flow\" value=\"Live API\" />
+          </div>
+          <div className=\"panel\">
+            <h2>Recent records</h2>
+            <div className=\"list\">{{items.map(item => <div className=\"item\" key={{item.id}}><span>{{item.title}}</span><span className=\"muted\">{{item.status}}</span></div>)}}</div>
+          </div>
+        </div>
+      </div>
+      <InspectorPanel />
     </div>
   );
 }}
-'''.strip()
+""".strip()
 
 
 def assistant_page_code(prompt: str) -> str:
-    return f'''
-import React from "react";
+    return f"""
+import React, {{ useEffect, useState }} from \"react\";
+import {{ ChatShell }} from \"../components/ChatShell.jsx\";
+import {{ ToolRail }} from \"../components/ToolRail.jsx\";
+import {{ MemoryPanel }} from \"../components/MemoryPanel.jsx\";
+import {{ getItems }} from \"../lib/api.js\";
 
 export function AssistantPage() {{
+  const [items, setItems] = useState([]);
+  useEffect(() => {{ getItems().then(setItems).catch(() => setItems([])); }}, []);
+
   return (
-    <div className="app-shell">
-      <section className="panel">
-        <div className="pill">Assistant</div>
-        <h1>AI Assistant Workspace</h1>
-        <p className="muted">{prompt}</p>
-      </section>
-      <section className="row two">
-        <div className="panel"><h3>Tools</h3><p className="muted">Upload, scan, history, actions</p></div>
-        <div className="panel"><h3>Conversation</h3><input className="input" placeholder="Ask something..." /></div>
+    <div className=\"app-shell\">
+      <div className=\"panel\">
+        <div className=\"pill\">Assistant workspace</div>
+        <h1>AI Assistant</h1>
+        <p className=\"muted\">{prompt}</p>
+      </div>
+      <div className=\"row two\">
+        <ToolRail />
+        <ChatShell />
+      </div>
+      <MemoryPanel />
+      <section className=\"panel\">
+        <h3>Saved items</h3>
+        <div className=\"list\">{{items.map(item => <div className=\"item\" key={{item.id}}><span>{{item.title}}</span><span className=\"muted\">{{item.status}}</span></div>)}}</div>
       </section>
     </div>
   );
 }}
-'''.strip()
+""".strip()
 
 
 def studio_page_code(prompt: str) -> str:
-    return f'''
-import React from "react";
+    return f"""
+import React, {{ useState }} from \"react\";
+import {{ EditorShell }} from \"../components/EditorShell.jsx\";
+import {{ PreviewPanel }} from \"../components/PreviewPanel.jsx\";
+import {{ NotesPanel }} from \"../components/NotesPanel.jsx\";
 
 export function StudioPage() {{
+  const [draft, setDraft] = useState(\"Start writing here...\");
+
   return (
-    <div className="app-shell">
-      <section className="panel">
-        <div className="pill">Studio</div>
-        <h1>Content Studio</h1>
-        <p className="muted">{prompt}</p>
-      </section>
-      <section className="row two">
-        <div className="panel"><h3>Editor</h3><textarea className="input" rows={{12}} defaultValue="Start writing here..." /></div>
-        <div className="panel"><h3>Preview</h3><div className="card">Live content preview</div></div>
-      </section>
+    <div className=\"app-shell\">
+      <div className=\"panel\">
+        <div className=\"pill\">Content studio</div>
+        <h1>Content App</h1>
+        <p className=\"muted\">{prompt}</p>
+      </div>
+      <div className=\"row two\">
+        <EditorShell value={{draft}} onChange={{setDraft}} />
+        <PreviewPanel value={{draft}} />
+      </div>
+      <NotesPanel />
     </div>
   );
 }}
-'''.strip()
+""".strip()
 
 
 def tool_page_code(prompt: str, battery_mode: bool) -> str:
-    helper = "Battery-focused starter logic included." if battery_mode else "This is a clean generated tool starter."
-    return f'''
-import React from "react";
+    extra = "Battery-focused starter logic can be added next." if battery_mode else "This is a clean generated tool starter."
+    return f"""
+import React, {{ useEffect, useState }} from \"react\";
+import {{ CalculatorForm }} from \"../components/CalculatorForm.jsx\";
+import {{ ResultsPanel }} from \"../components/ResultsPanel.jsx\";
+import {{ ExportActions }} from \"../components/ExportActions.jsx\";
+import {{ getItems, createItem }} from \"../lib/api.js\";
 
 export function ToolPage() {{
+  const [items, setItems] = useState([]);
+  const [result, setResult] = useState(null);
+
+  useEffect(() => {{ getItems().then(setItems).catch(() => setItems([])); }}, []);
+
+  async function handleSave() {{
+    const created = await createItem({{ title: \"Generated result\", status: \"saved\", value: result || \"pending\" }});
+    setItems(prev => [created, ...prev]);
+  }}
+
   return (
-    <div className="app-shell">
-      <section className="panel">
-        <div className="pill">Tool</div>
+    <div className=\"app-shell\">
+      <div className=\"panel\">
+        <div className=\"pill\">Tool workspace</div>
         <h1>Tool / Calculator</h1>
-        <p className="muted">{prompt}</p>
-        <p className="muted">{helper}</p>
-      </section>
-      <section className="row two">
-        <div className="panel"><h3>Inputs</h3><input className="input" placeholder="Value 1" /></div>
-        <div className="panel"><h3>Results</h3><div className="card">Calculated output will appear here.</div></div>
+        <p className=\"muted\">{prompt}</p>
+        <p className=\"muted\">{extra}</p>
+      </div>
+      <div className=\"row two\">
+        <CalculatorForm onCalculated={{setResult}} />
+        <ResultsPanel result={{result}} onSave={{handleSave}} />
+      </div>
+      <ExportActions />
+      <section className=\"panel\">
+        <h3>Saved results</h3>
+        <div className=\"list\">{{items.map(item => <div className=\"item\" key={{item.id}}><span>{{item.title}}</span><span className=\"muted\">{{item.status}}</span></div>)}}</div>
       </section>
     </div>
   );
 }}
-'''.strip()
+""".strip()
+
+
+def sidebar_code() -> str:
+    return """
+import React from \"react\";
+
+export function Sidebar() {
+  return (
+    <aside className=\"panel\">
+      <h3>Navigation</h3>
+      <div className=\"card-grid\">
+        <div className=\"card\">Overview</div>
+        <div className=\"card\">Customers</div>
+        <div className=\"card\">Deals</div>
+        <div className=\"card\">Reports</div>
+      </div>
+    </aside>
+  );
+}
+""".strip()
+
+
+def kpi_card_code() -> str:
+    return """
+import React from \"react\";
+
+export function KpiCard({ title, value }) {
+  return (
+    <div className=\"card\">
+      <div className=\"pill\">{title}</div>
+      <h3>{value}</h3>
+    </div>
+  );
+}
+""".strip()
+
+
+def inspector_code() -> str:
+    return """
+import React from \"react\";
+
+export function InspectorPanel() {
+  return (
+    <section className=\"panel\">
+      <h3>Inspector</h3>
+      <p className=\"muted\">Use this space for details, selected records, and quick controls.</p>
+    </section>
+  );
+}
+""".strip()
+
+
+def chat_shell_code() -> str:
+    return """
+import React, { useState } from \"react\";
+
+export function ChatShell() {
+  const [message, setMessage] = useState(\"\");
+  return (
+    <section className=\"panel\">
+      <h3>Conversation</h3>
+      <div className=\"card\">Assistant response area</div>
+      <input className=\"input\" value={message} onChange={(e) => setMessage(e.target.value)} placeholder=\"Ask something...\" />
+    </section>
+  );
+}
+""".strip()
+
+
+def tool_rail_code() -> str:
+    return """
+import React from \"react\";
+
+export function ToolRail() {
+  return (
+    <aside className=\"panel\">
+      <h3>Tools</h3>
+      <div className=\"card-grid\">
+        <div className=\"card\">Search</div>
+        <div className=\"card\">Actions</div>
+        <div className=\"card\">History</div>
+      </div>
+    </aside>
+  );
+}
+""".strip()
+
+
+def memory_panel_code() -> str:
+    return """
+import React from \"react\";
+
+export function MemoryPanel() {
+  return (
+    <section className=\"panel\">
+      <h3>Memory</h3>
+      <p className=\"muted\">Save notes, pinned answers, and reusable context here.</p>
+    </section>
+  );
+}
+""".strip()
+
+
+def editor_shell_code() -> str:
+    return """
+import React from \"react\";
+
+export function EditorShell({ value, onChange }) {
+  return (
+    <section className=\"panel\">
+      <h3>Editor</h3>
+      <textarea className=\"input\" rows={12} value={value} onChange={(e) => onChange(e.target.value)} />
+    </section>
+  );
+}
+""".strip()
+
+
+def preview_panel_code() -> str:
+    return """
+import React from \"react\";
+
+export function PreviewPanel({ value }) {
+  return (
+    <section className=\"panel\">
+      <h3>Preview</h3>
+      <div className=\"card\">{value}</div>
+    </section>
+  );
+}
+""".strip()
+
+
+def notes_panel_code() -> str:
+    return """
+import React from \"react\";
+
+export function NotesPanel() {
+  return (
+    <section className=\"panel\">
+      <h3>Notes</h3>
+      <textarea className=\"input\" rows={6} defaultValue=\"Draft notes...\" />
+    </section>
+  );
+}
+""".strip()
+
+
+def calculator_form_code() -> str:
+    return """
+import React, { useState } from \"react\";
+
+export function CalculatorForm({ onCalculated }) {
+  const [a, setA] = useState(\"\");
+  const [b, setB] = useState(\"\");
+
+  function handleCalculate() {
+    const total = Number(a || 0) + Number(b || 0);
+    onCalculated?.(total);
+  }
+
+  return (
+    <section className=\"panel\">
+      <h3>Inputs</h3>
+      <div className=\"row\">
+        <input className=\"input\" placeholder=\"Value 1\" value={a} onChange={(e) => setA(e.target.value)} />
+        <input className=\"input\" placeholder=\"Value 2\" value={b} onChange={(e) => setB(e.target.value)} />
+        <button className=\"primary-btn\" onClick={handleCalculate}>Calculate</button>
+      </div>
+    </section>
+  );
+}
+""".strip()
+
+
+def results_panel_code() -> str:
+    return """
+import React from \"react\";
+
+export function ResultsPanel({ result, onSave }) {
+  return (
+    <section className=\"panel\">
+      <h3>Results</h3>
+      <div className=\"card\">{result === null ? \"Calculated output will appear here.\" : `Result: ${result}`}</div>
+      <button className=\"primary-btn\" onClick={onSave}>Save Result</button>
+    </section>
+  );
+}
+""".strip()
+
+
+def export_actions_code() -> str:
+    return """
+import React from \"react\";
+
+export function ExportActions() {
+  return (
+    <section className=\"panel\">
+      <h3>Export</h3>
+      <div className=\"row\">
+        <button className=\"primary-btn\">Export JSON</button>
+        <button className=\"primary-btn\">Export PDF</button>
+      </div>
+    </section>
+  );
+}
+""".strip()
 
 
 def login_page_code() -> str:
-    return r'''
-import React, { useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
-import { useAuth } from "../lib/auth.js";
+    return """
+import React, { useState } from \"react\";
+import { signIn } from \"../lib/auth.js\";
 
 export function LoginPage() {
-  const navigate = useNavigate();
-  const { login, loading, error } = useAuth();
-  const [form, setForm] = useState({ email: "", password: "" });
+  const [email, setEmail] = useState(\"\");
+  const [password, setPassword] = useState(\"\");
 
-  async function handleSubmit(event) {
-    event.preventDefault();
-    const result = await login(form.email, form.password);
-    if (result.ok) navigate("/app");
+  function handleSubmit() {
+    signIn(email, password);
   }
 
   return (
-    <div className="app-shell">
-      <section className="panel" style={{ maxWidth: 520, margin: "0 auto", width: "100%" }}>
-        <div className="pill">Auth</div>
-        <h1>Sign in</h1>
-        <p className="muted">Use your account to access the private app workspace.</p>
-        <form className="row" onSubmit={handleSubmit}>
-          <input className="input" placeholder="Email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} />
-          <input className="input" placeholder="Password" type="password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} />
-          <button className="primary-btn" disabled={loading}>{loading ? "Signing in..." : "Sign in"}</button>
-        </form>
-        {error ? <p className="muted">{error}</p> : null}
-        <p className="muted">No account? <Link to="/register">Create one</Link></p>
+    <div className=\"app-shell\">
+      <section className=\"panel\">
+        <h1>Login</h1>
+        <div className=\"row\">
+          <input className=\"input\" placeholder=\"Email\" value={email} onChange={(e) => setEmail(e.target.value)} />
+          <input className=\"input\" placeholder=\"Password\" type=\"password\" value={password} onChange={(e) => setPassword(e.target.value)} />
+          <button className=\"primary-btn\" onClick={handleSubmit}>Sign in</button>
+        </div>
       </section>
     </div>
   );
 }
-'''.strip()
+""".strip()
 
 
-def register_page_code() -> str:
-    return r'''
-import React, { useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
-import { useAuth } from "../lib/auth.js";
-
-export function RegisterPage() {
-  const navigate = useNavigate();
-  const { register, loading, error } = useAuth();
-  const [form, setForm] = useState({ name: "", email: "", password: "" });
-
-  async function handleSubmit(event) {
-    event.preventDefault();
-    const result = await register(form);
-    if (result.ok) navigate("/app");
-  }
-
-  return (
-    <div className="app-shell">
-      <section className="panel" style={{ maxWidth: 520, margin: "0 auto", width: "100%" }}>
-        <div className="pill">Auth</div>
-        <h1>Create account</h1>
-        <form className="row" onSubmit={handleSubmit}>
-          <input className="input" placeholder="Name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
-          <input className="input" placeholder="Email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} />
-          <input className="input" placeholder="Password" type="password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} />
-          <button className="primary-btn" disabled={loading}>{loading ? "Creating..." : "Create account"}</button>
-        </form>
-        {error ? <p className="muted">{error}</p> : null}
-        <p className="muted">Already have an account? <Link to="/login">Sign in</Link></p>
-      </section>
-    </div>
-  );
-}
-'''.strip()
-
-
-def protected_route_code() -> str:
-    return r'''
-import React from "react";
-import { Navigate } from "react-router-dom";
-import { useAuth } from "../lib/auth.js";
-
-export function ProtectedRoute({ children }) {
-  const { user, booting } = useAuth();
-  if (booting) return <div className="app-shell"><section className="panel">Loading...</section></div>;
-  if (!user) return <Navigate to="/login" replace />;
-  return children;
-}
-'''.strip()
-
-
-def auth_client_code() -> str:
-    return r'''
-import React, { createContext, useContext, useEffect, useMemo, useState } from "react";
-
-const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
-const AuthContext = createContext(null);
-
-export function AuthProvider({ children }) {
-  const [token, setToken] = useState(() => localStorage.getItem("app_token") || "");
-  const [user, setUser] = useState(() => {
-    const raw = localStorage.getItem("app_user");
-    return raw ? JSON.parse(raw) : null;
-  });
-  const [loading, setLoading] = useState(false);
-  const [booting, setBooting] = useState(true);
-  const [error, setError] = useState("");
-
-  useEffect(() => {
-    async function boot() {
-      if (!token) {
-        setBooting(false);
-        return;
-      }
-      try {
-        const response = await fetch(`${API_BASE}/api/auth/me`, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
-        if (!response.ok) throw new Error("Session expired");
-        const data = await response.json();
-        setUser(data.user);
-      } catch (err) {
-        localStorage.removeItem("app_token");
-        localStorage.removeItem("app_user");
-        setToken("");
-        setUser(null);
-      } finally {
-        setBooting(false);
-      }
-    }
-    boot();
-  }, [token]);
-
-  function persist(sessionToken, sessionUser) {
-    setToken(sessionToken);
-    setUser(sessionUser);
-    localStorage.setItem("app_token", sessionToken);
-    localStorage.setItem("app_user", JSON.stringify(sessionUser));
-  }
-
-  async function login(email, password) {
-    setLoading(true);
-    setError("");
-    try {
-      const response = await fetch(`${API_BASE}/api/auth/login`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, password }),
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.detail || "Login failed");
-      persist(data.token, data.user);
-      return { ok: true };
-    } catch (err) {
-      setError(err.message || "Login failed");
-      return { ok: false };
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function register(payload) {
-    setLoading(true);
-    setError("");
-    try {
-      const response = await fetch(`${API_BASE}/api/auth/register`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.detail || "Registration failed");
-      persist(data.token, data.user);
-      return { ok: true };
-    } catch (err) {
-      setError(err.message || "Registration failed");
-      return { ok: false };
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  function logout() {
-    setToken("");
-    setUser(null);
-    localStorage.removeItem("app_token");
-    localStorage.removeItem("app_user");
-  }
-
-  const value = useMemo(() => ({ user, token, loading, booting, error, login, register, logout }), [user, token, loading, booting, error]);
-  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+def auth_code() -> str:
+    return """
+export function signIn(email, password) {
+  const token = `demo-token-${email || \"guest\"}`;
+  localStorage.setItem(\"builder_token\", token);
+  return { ok: true, email, token };
 }
 
-export function useAuth() {
-  const context = useContext(AuthContext);
-  if (!context) throw new Error("useAuth must be used inside AuthProvider");
-  return context;
+export function getToken() {
+  return localStorage.getItem(\"builder_token\") || \"\";
 }
-'''.strip()
+""".strip()
 
 
 def battery_math_code() -> str:
@@ -749,50 +860,124 @@ export function estimateBatteryPlan(items = [], voltage = 12, autonomyDays = 1, 
 """.strip()
 
 
+def appliance_table_code() -> str:
+    return """
+import React from \"react\";
+
+export function ApplianceTable() {
+  return (
+    <section className=\"panel\">
+      <h3>Appliances</h3>
+      <div className=\"card\">RV Fridge · Lights · Fan</div>
+    </section>
+  );
+}
+""".strip()
+
+
 def api_client_code() -> str:
-    return r'''
-const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
+    return """
+const API_BASE = import.meta.env.VITE_API_URL || \"http://localhost:8000\";
 
-export async function apiRequest(path, options = {}) {
-  const token = localStorage.getItem("app_token") || "";
-  const headers = {
-    "Content-Type": "application/json",
-    ...(options.headers || {}),
-  };
-  if (token) headers.Authorization = `Bearer ${token}`;
-
+async function request(path, options = {}) {
   const response = await fetch(`${API_BASE}${path}`, {
+    headers: { \"Content-Type\": \"application/json\", ...(options.headers || {}) },
     ...options,
-    headers,
   });
-  const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(data.detail || `Request failed: ${response.status}`);
+    throw new Error(`API error: ${response.status}`);
   }
-  return data;
+  return response.json();
 }
 
-export function listItems() {
-  return apiRequest("/api/items");
+export async function getItems() {
+  return request(\"/api/items\");
 }
 
-export function createItem(payload) {
-  return apiRequest("/api/items", { method: "POST", body: JSON.stringify(payload) });
+export async function createItem(payload) {
+  return request(\"/api/items\", { method: \"POST\", body: JSON.stringify(payload) });
 }
-'''.strip()
+
+export async function updateItem(id, payload) {
+  return request(`/api/items/${id}`, { method: \"PUT\", body: JSON.stringify(payload) });
+}
+
+export async function deleteItem(id) {
+  return request(`/api/items/${id}`, { method: \"DELETE\" });
+}
+""".strip()
 
 
-# ---------- generated backend templates ----------
-def generated_backend_main(persistence: str, include_auth: bool) -> str:
-    auth_import = "from auth import auth_router\n" if include_auth else ""
-    auth_router_include = "app.include_router(auth_router)\n" if include_auth else ""
-    return f'''
-from fastapi import FastAPI
+def use_items_hook_code() -> str:
+    return """
+import { useEffect, useState } from \"react\";
+import { getItems, createItem, updateItem, deleteItem } from \"../lib/api.js\";
+
+export function useItems() {
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(\"\");
+
+  async function refresh() {
+    try {
+      setLoading(true);
+      setError(\"\");
+      const data = await getItems();
+      setItems(data);
+    } catch (err) {
+      setError(err.message || \"Failed to load items\");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function addItem(payload) {
+    const created = await createItem(payload);
+    setItems((prev) => [created, ...prev]);
+    return created;
+  }
+
+  async function saveItem(id, payload) {
+    const updated = await updateItem(id, payload);
+    setItems((prev) => prev.map((item) => item.id === id ? updated : item));
+    return updated;
+  }
+
+  async function removeItem(id) {
+    await deleteItem(id);
+    setItems((prev) => prev.filter((item) => item.id !== id));
+  }
+
+  useEffect(() => { refresh(); }, []);
+
+  return { items, loading, error, refresh, addItem, saveItem, removeItem };
+}
+""".strip()
+
+
+def backend_requirements_code(persistence: str) -> str:
+    base = ["fastapi", "uvicorn[standard]", "pydantic"]
+    if persistence == "sqlite":
+        base.append("sqlalchemy")
+    if persistence == "supabase":
+        base += ["supabase", "python-dotenv"]
+    return "\n".join(base)
+
+
+def backend_env_example_code(persistence: str) -> str:
+    lines = ["PORT=8000"]
+    if persistence == "supabase":
+        lines += ["SUPABASE_URL=your_supabase_url", "SUPABASE_KEY=your_supabase_key"]
+    return "\n".join(lines)
+
+
+def backend_api_code(persistence: str) -> str:
+    store_import = "from data_store import list_items, create_item, update_item, delete_item"
+    return f'''from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List
-from data_store import list_items, create_item, update_item, delete_item
-{auth_import}
+from pydantic import BaseModel, Field
+from typing import Any, Dict, List
+{store_import}
 
 app = FastAPI(title="Generated App Backend")
 
@@ -804,385 +989,227 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-{auth_router_include}
-class ItemIn(BaseModel):
-    name: str
-    description: str = ""
-
+class ItemPayload(BaseModel):
+    title: str = "Untitled"
+    status: str = "draft"
+    value: Any = None
+    meta: Dict[str, Any] = Field(default_factory=dict)
 
 @app.get("/health")
 def health():
-    return {{"status": "healthy", "persistence": "{persistence}"}}
-
+    return {{"status": "ok", "persistence": "{persistence}"}}
 
 @app.get("/api/items")
 def get_items():
-    return {{"items": list_items()}}
-
+    return list_items()
 
 @app.post("/api/items")
-def post_item(payload: ItemIn):
-    item = create_item(payload.model_dump())
-    return {{"ok": True, "item": item}}
-
+def post_item(payload: ItemPayload):
+    return create_item(payload.model_dump())
 
 @app.put("/api/items/{{item_id}}")
-def put_item(item_id: int, payload: ItemIn):
-    item = update_item(item_id, payload.model_dump())
-    return {{"ok": True, "item": item}}
-
+def put_item(item_id: int, payload: ItemPayload):
+    updated = update_item(item_id, payload.model_dump())
+    if not updated:
+        raise HTTPException(status_code=404, detail="Item not found")
+    return updated
 
 @app.delete("/api/items/{{item_id}}")
 def remove_item(item_id: int):
-    delete_item(item_id)
-    return {{"ok": True}}
+    deleted = delete_item(item_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Item not found")
+    return {{"ok": True, "id": item_id}}
 '''.strip()
 
 
-def generated_requirements(include_auth: bool, persistence: str) -> str:
-    deps = ["fastapi", "uvicorn[standard]", "pydantic"]
-    if include_auth:
-        deps += ["pyjwt", "passlib[bcrypt]"]
-    if persistence == "supabase":
-        deps.append("supabase")
-    return "\n".join(sorted(set(deps)))
+def localstorage_backend_store_code() -> str:
+    return '''_ITEMS = [
+    {"id": 1, "title": "Sample item", "status": "ready", "value": 42, "meta": {}},
+    {"id": 2, "title": "Starter record", "status": "draft", "value": None, "meta": {}},
+]
 
-
-def generated_env_example(include_auth: bool, persistence: str) -> str:
-    lines = ["PORT=8000"]
-    if include_auth:
-        lines += ["JWT_SECRET=change-me", "JWT_ALGORITHM=HS256", "TOKEN_EXPIRE_MINUTES=43200"]
-    if persistence == "supabase":
-        lines += ["SUPABASE_URL=https://your-project.supabase.co", "SUPABASE_KEY=your-service-role-key"]
-    return "\n".join(lines)
-
-
-def generated_data_store_code(persistence: str) -> str:
-    if persistence == "localstorage":
-        return '''
-_items = []
-_next_id = 1
 
 def list_items():
-    return _items
+    return list(reversed(_ITEMS))
+
 
 def create_item(payload):
-    global _next_id
-    item = {"id": _next_id, **payload}
-    _items.append(item)
-    _next_id += 1
+    new_id = max([item["id"] for item in _ITEMS], default=0) + 1
+    item = {"id": new_id, **payload}
+    _ITEMS.append(item)
     return item
 
+
 def update_item(item_id, payload):
-    for item in _items:
+    for index, item in enumerate(_ITEMS):
         if item["id"] == item_id:
-            item.update(payload)
-            return item
-    return {"id": item_id, **payload}
+            updated = {"id": item_id, **payload}
+            _ITEMS[index] = updated
+            return updated
+    return None
+
 
 def delete_item(item_id):
-    global _items
-    _items = [item for item in _items if item["id"] != item_id]
+    for index, item in enumerate(_ITEMS):
+        if item["id"] == item_id:
+            _ITEMS.pop(index)
+            return True
+    return False
 '''.strip()
-    return '''
-import sqlite3
+
+
+def sqlite_backend_store_code() -> str:
+    return '''import sqlite3
 from pathlib import Path
 
 DB_PATH = Path(__file__).with_name("app.db")
 
 
-def get_conn():
+def _connect():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def init_db():
-    conn = get_conn()
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS items (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      description TEXT DEFAULT ''
+def _init():
+    conn = _connect()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL,
+            value TEXT,
+            meta TEXT
+        )
+        """
     )
-    """)
     conn.commit()
     conn.close()
 
 
+_init()
+
+
 def list_items():
-    init_db()
-    conn = get_conn()
-    rows = conn.execute("SELECT id, name, description FROM items ORDER BY id DESC").fetchall()
+    conn = _connect()
+    rows = conn.execute("SELECT id, title, status, value, meta FROM items ORDER BY id DESC").fetchall()
     conn.close()
     return [dict(row) for row in rows]
 
 
 def create_item(payload):
-    init_db()
-    conn = get_conn()
-    cur = conn.execute(
-        "INSERT INTO items (name, description) VALUES (?, ?)",
-        (payload.get("name", ""), payload.get("description", "")),
+    conn = _connect()
+    cursor = conn.execute(
+        "INSERT INTO items (title, status, value, meta) VALUES (?, ?, ?, ?)",
+        (payload.get("title", "Untitled"), payload.get("status", "draft"), str(payload.get("value")), json.dumps(payload.get("meta", {}))),
     )
     conn.commit()
-    item_id = cur.lastrowid
+    item_id = cursor.lastrowid
     conn.close()
     return {"id": item_id, **payload}
 
 
 def update_item(item_id, payload):
-    init_db()
-    conn = get_conn()
-    conn.execute(
-        "UPDATE items SET name = ?, description = ? WHERE id = ?",
-        (payload.get("name", ""), payload.get("description", ""), item_id),
+    conn = _connect()
+    cursor = conn.execute(
+        "UPDATE items SET title = ?, status = ?, value = ?, meta = ? WHERE id = ?",
+        (payload.get("title", "Untitled"), payload.get("status", "draft"), str(payload.get("value")), json.dumps(payload.get("meta", {})), item_id),
     )
     conn.commit()
     conn.close()
+    if not cursor.rowcount:
+        return None
     return {"id": item_id, **payload}
 
 
 def delete_item(item_id):
-    init_db()
-    conn = get_conn()
-    conn.execute("DELETE FROM items WHERE id = ?", (item_id,))
+    conn = _connect()
+    cursor = conn.execute("DELETE FROM items WHERE id = ?", (item_id,))
     conn.commit()
     conn.close()
+    return bool(cursor.rowcount)
 '''.strip()
 
 
-def generated_auth_backend_code(persistence: str) -> str:
-    if persistence == "localstorage":
-        return '''
-import os
-import time
-import hashlib
-import hmac
-import base64
-import json
-from fastapi import APIRouter, Header, HTTPException
-from pydantic import BaseModel, EmailStr
+def supabase_backend_store_code() -> str:
+    return '''import os
+from supabase import create_client
 
-JWT_SECRET = os.getenv("JWT_SECRET", "change-me")
-auth_router = APIRouter(prefix="/api/auth", tags=["auth"])
-_users = []
-
-class RegisterInput(BaseModel):
-    name: str
-    email: EmailStr
-    password: str
-
-class LoginInput(BaseModel):
-    email: EmailStr
-    password: str
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
 
-def make_hash(password: str) -> str:
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+def list_items():
+    if not client:
+        return []
+    result = client.table("items").select("*").order("id", desc=True).execute()
+    return result.data or []
 
 
-def sign_token(payload: dict) -> str:
-    body = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
-    sig = hmac.new(JWT_SECRET.encode(), body.encode(), hashlib.sha256).hexdigest()
-    return f"{body}.{sig}"
+def create_item(payload):
+    if not client:
+        return {"id": 1, **payload}
+    result = client.table("items").insert(payload).execute()
+    return (result.data or [payload])[0]
 
 
-def read_token(token: str) -> dict:
-    try:
-        body, sig = token.split(".", 1)
-        expected = hmac.new(JWT_SECRET.encode(), body.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(sig, expected):
-            raise ValueError("bad signature")
-        return json.loads(base64.urlsafe_b64decode(body + "==").decode())
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid token")
+def update_item(item_id, payload):
+    if not client:
+        return {"id": item_id, **payload}
+    result = client.table("items").update(payload).eq("id", item_id).execute()
+    data = result.data or []
+    return data[0] if data else None
 
 
-def get_user_from_header(authorization: str | None):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing token")
-    payload = read_token(authorization.split(" ", 1)[1])
-    for user in _users:
-        if user["id"] == payload.get("sub"):
-            return {k: v for k, v in user.items() if k != "password_hash"}
-    raise HTTPException(status_code=401, detail="User not found")
-
-@auth_router.post("/register")
-def register(payload: RegisterInput):
-    for user in _users:
-        if user["email"].lower() == payload.email.lower():
-            raise HTTPException(status_code=400, detail="Email already in use")
-    user = {
-        "id": len(_users) + 1,
-        "name": payload.name,
-        "email": payload.email.lower(),
-        "password_hash": make_hash(payload.password),
-    }
-    _users.append(user)
-    safe_user = {k: v for k, v in user.items() if k != "password_hash"}
-    token = sign_token({"sub": user["id"], "iat": int(time.time())})
-    return {"ok": True, "user": safe_user, "token": token}
-
-@auth_router.post("/login")
-def login(payload: LoginInput):
-    for user in _users:
-        if user["email"] == payload.email.lower() and user["password_hash"] == make_hash(payload.password):
-            safe_user = {k: v for k, v in user.items() if k != "password_hash"}
-            token = sign_token({"sub": user["id"], "iat": int(time.time())})
-            return {"ok": True, "user": safe_user, "token": token}
-    raise HTTPException(status_code=401, detail="Invalid credentials")
-
-@auth_router.get("/me")
-def me(authorization: str | None = Header(default=None)):
-    return {"user": get_user_from_header(authorization)}
-'''.strip()
-
-    return '''
-import os
-import sqlite3
-import jwt
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from fastapi import APIRouter, Header, HTTPException
-from pydantic import BaseModel, EmailStr
-from passlib.context import CryptContext
-
-JWT_SECRET = os.getenv("JWT_SECRET", "change-me")
-JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
-TOKEN_EXPIRE_MINUTES = int(os.getenv("TOKEN_EXPIRE_MINUTES", "43200"))
-DB_PATH = Path(__file__).with_name("app.db")
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-auth_router = APIRouter(prefix="/api/auth", tags=["auth"])
-
-class RegisterInput(BaseModel):
-    name: str
-    email: EmailStr
-    password: str
-
-class LoginInput(BaseModel):
-    email: EmailStr
-    password: str
-
-
-def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_users():
-    conn = get_conn()
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      email TEXT NOT NULL UNIQUE,
-      password_hash TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    )
-    """)
-    conn.commit()
-    conn.close()
-
-
-def create_token(user_id: int):
-    expire = datetime.now(timezone.utc) + timedelta(minutes=TOKEN_EXPIRE_MINUTES)
-    return jwt.encode({"sub": str(user_id), "exp": expire}, JWT_SECRET, algorithm=JWT_ALGORITHM)
-
-
-def get_current_user(authorization: str | None):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing token")
-    token = authorization.split(" ", 1)[1]
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    user_id = int(payload.get("sub", 0))
-    conn = get_conn()
-    user = conn.execute("SELECT id, name, email FROM users WHERE id = ?", (user_id,)).fetchone()
-    conn.close()
-    if not user:
-        raise HTTPException(status_code=401, detail="User not found")
-    return dict(user)
-
-@auth_router.post("/register")
-def register(payload: RegisterInput):
-    init_users()
-    conn = get_conn()
-    existing = conn.execute("SELECT id FROM users WHERE email = ?", (payload.email.lower(),)).fetchone()
-    if existing:
-        conn.close()
-        raise HTTPException(status_code=400, detail="Email already in use")
-    password_hash = pwd_context.hash(payload.password)
-    cur = conn.execute(
-        "INSERT INTO users (name, email, password_hash, created_at) VALUES (?, ?, ?, ?)",
-        (payload.name, payload.email.lower(), password_hash, datetime.utcnow().isoformat()),
-    )
-    conn.commit()
-    user_id = cur.lastrowid
-    user = conn.execute("SELECT id, name, email FROM users WHERE id = ?", (user_id,)).fetchone()
-    conn.close()
-    token = create_token(user_id)
-    return {"ok": True, "user": dict(user), "token": token}
-
-@auth_router.post("/login")
-def login(payload: LoginInput):
-    init_users()
-    conn = get_conn()
-    row = conn.execute(
-        "SELECT id, name, email, password_hash FROM users WHERE email = ?",
-        (payload.email.lower(),),
-    ).fetchone()
-    conn.close()
-    if not row or not pwd_context.verify(payload.password, row["password_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    token = create_token(row["id"])
-    return {
-        "ok": True,
-        "user": {"id": row["id"], "name": row["name"], "email": row["email"]},
-        "token": token,
-    }
-
-@auth_router.get("/me")
-def me(authorization: str | None = Header(default=None)):
-    return {"user": get_current_user(authorization)}
+def delete_item(item_id):
+    if not client:
+        return True
+    client.table("items").delete().eq("id", item_id).execute()
+    return True
 '''.strip()
 
 
-def generated_supabase_schema() -> str:
-    return '''
-create table if not exists public.users (
-  id uuid primary key default gen_random_uuid(),
-  email text not null unique,
-  name text not null,
-  created_at timestamptz default now()
-);
-
-create table if not exists public.items (
-  id uuid primary key default gen_random_uuid(),
-  name text not null,
-  description text default '',
-  user_id uuid references public.users(id) on delete cascade,
-  created_at timestamptz default now()
+def supabase_schema_code() -> str:
+    return '''create table if not exists items (
+  id bigint generated by default as identity primary key,
+  title text not null,
+  status text not null default 'draft',
+  value text,
+  meta jsonb default '{}'::jsonb
 );
 '''.strip()
 
 
-def generated_readme(app_type: str, systems: List[str], persistence: str) -> str:
+def package_json_code() -> str:
+    return json.dumps({
+        "name": "generated-builder-app",
+        "private": True,
+        "version": "0.0.1",
+        "type": "module",
+        "scripts": {"dev": "vite", "build": "vite build", "preview": "vite preview"},
+        "dependencies": {"react": "^18.3.1", "react-dom": "^18.3.1"},
+        "devDependencies": {"vite": "^5.4.10"},
+    }, indent=2)
+
+
+def vite_env_example_code() -> str:
+    return "VITE_API_URL=http://localhost:8000\n"
+
+
+def readme_code(app_type: str, persistence: str, systems: List[str]) -> str:
     return f'''# Generated App
 
-This project was generated by your Builder AI.
-
 ## App type
-- {app_type}
+{app_type}
 
 ## Systems
-- {', '.join(systems) if systems else 'base only'}
+{", ".join(systems) if systems else "base"}
 
 ## Persistence
-- {persistence}
+{persistence}
 
 ## Frontend
 ```bash
@@ -1195,258 +1222,78 @@ npm run dev
 ```bash
 cd backend
 pip install -r requirements.txt
-uvicorn main:app --reload
+uvicorn main:app --reload --port 8000
 ```
 '''.strip()
 
 
-def generated_package_json() -> str:
-    return '''
-{
-  "name": "generated-builder-app",
-  "private": true,
-  "version": "0.1.0",
-  "type": "module",
-  "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview"
-  },
-  "dependencies": {
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "react-router-dom": "^6.28.0"
-  },
-  "devDependencies": {
-    "vite": "^5.4.10"
-  }
-}
-'''.strip()
-
-
-def generated_vite_index_html() -> str:
-    return '''
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Generated Builder App</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.jsx"></script>
-  </body>
-</html>
-'''.strip()
-
-
-def generated_frontend_env() -> str:
-    return 'VITE_API_BASE=http://localhost:8000'
-
-
-def generated_gitignore() -> str:
-    return '''
-node_modules/
-dist/
-__pycache__/
-*.pyc
-.env
-backend/app.db
-'''.strip()
-
-
-# ---------- generator ----------
-def generate_code_bundle(prompt: str, app_type: str, builder_mode: str, style: str, systems: List[str], persistence: str, complexity: str) -> List[Dict[str, Any]]:
-    files: List[Dict[str, Any]] = [
+def generate_code_bundle(prompt: str, app_type: str, builder_mode: str, style: str, systems: List[str], persistence: str) -> List[Dict[str, Any]]:
+    files = [
         {"path": "frontend/src/main.jsx", "language": "javascript", "content": main_jsx()},
-        {"path": "frontend/src/App.jsx", "language": "javascript", "content": app_router_code(app_type, systems)},
+        {"path": "frontend/src/App.jsx", "language": "javascript", "content": root_app_code(app_type)},
         {"path": "frontend/src/styles/app.css", "language": "css", "content": app_css(style)},
-        {"path": "frontend/package.json", "language": "json", "content": generated_package_json()},
-        {"path": "frontend/index.html", "language": "html", "content": generated_vite_index_html()},
-        {"path": "frontend/.env.example", "language": "env", "content": generated_frontend_env()},
-        {"path": ".gitignore", "language": "text", "content": generated_gitignore()},
-        {"path": "README.md", "language": "markdown", "content": generated_readme(app_type, systems, persistence)},
-        {"path": "backend/main.py", "language": "python", "content": generated_backend_main(persistence, "auth" in systems)},
-        {"path": "backend/data_store.py", "language": "python", "content": generated_data_store_code(persistence)},
-        {"path": "backend/requirements.txt", "language": "text", "content": generated_requirements("auth" in systems, persistence)},
-        {"path": "backend/.env.example", "language": "env", "content": generated_env_example("auth" in systems, persistence)},
         {"path": "frontend/src/lib/api.js", "language": "javascript", "content": api_client_code()},
+        {"path": "frontend/package.json", "language": "json", "content": package_json_code()},
+        {"path": "frontend/.env.example", "language": "text", "content": vite_env_example_code()},
+        {"path": "backend/main.py", "language": "python", "content": backend_api_code(persistence)},
+        {"path": "backend/requirements.txt", "language": "text", "content": backend_requirements_code(persistence)},
+        {"path": "backend/.env.example", "language": "text", "content": backend_env_example_code(persistence)},
+        {"path": "README.md", "language": "markdown", "content": readme_code(app_type, persistence, systems)},
     ]
 
     if app_type == "admin panel":
-        files.append({"path": "frontend/src/pages/DashboardPage.jsx", "language": "javascript", "content": dashboard_page_code(prompt)})
+        files += [
+            {"path": "frontend/src/pages/DashboardPage.jsx", "language": "javascript", "content": dashboard_page_code(prompt)},
+            {"path": "frontend/src/components/Sidebar.jsx", "language": "javascript", "content": sidebar_code()},
+            {"path": "frontend/src/components/KpiCard.jsx", "language": "javascript", "content": kpi_card_code()},
+            {"path": "frontend/src/components/InspectorPanel.jsx", "language": "javascript", "content": inspector_code()},
+        ]
     elif app_type == "assistant app":
-        files.append({"path": "frontend/src/pages/AssistantPage.jsx", "language": "javascript", "content": assistant_page_code(prompt)})
+        files += [
+            {"path": "frontend/src/pages/AssistantPage.jsx", "language": "javascript", "content": assistant_page_code(prompt)},
+            {"path": "frontend/src/components/ChatShell.jsx", "language": "javascript", "content": chat_shell_code()},
+            {"path": "frontend/src/components/ToolRail.jsx", "language": "javascript", "content": tool_rail_code()},
+            {"path": "frontend/src/components/MemoryPanel.jsx", "language": "javascript", "content": memory_panel_code()},
+        ]
     elif app_type == "content app":
-        files.append({"path": "frontend/src/pages/StudioPage.jsx", "language": "javascript", "content": studio_page_code(prompt)})
+        files += [
+            {"path": "frontend/src/pages/StudioPage.jsx", "language": "javascript", "content": studio_page_code(prompt)},
+            {"path": "frontend/src/components/EditorShell.jsx", "language": "javascript", "content": editor_shell_code()},
+            {"path": "frontend/src/components/PreviewPanel.jsx", "language": "javascript", "content": preview_panel_code()},
+            {"path": "frontend/src/components/NotesPanel.jsx", "language": "javascript", "content": notes_panel_code()},
+        ]
     else:
-        files.append({"path": "frontend/src/pages/ToolPage.jsx", "language": "javascript", "content": tool_page_code(prompt, builder_mode == "battery-planner")})
+        files += [
+            {"path": "frontend/src/pages/ToolPage.jsx", "language": "javascript", "content": tool_page_code(prompt, builder_mode == "battery-planner")},
+            {"path": "frontend/src/components/CalculatorForm.jsx", "language": "javascript", "content": calculator_form_code()},
+            {"path": "frontend/src/components/ResultsPanel.jsx", "language": "javascript", "content": results_panel_code()},
+            {"path": "frontend/src/components/ExportActions.jsx", "language": "javascript", "content": export_actions_code()},
+        ]
 
     if "auth" in systems:
         files += [
             {"path": "frontend/src/pages/LoginPage.jsx", "language": "javascript", "content": login_page_code()},
-            {"path": "frontend/src/pages/RegisterPage.jsx", "language": "javascript", "content": register_page_code()},
-            {"path": "frontend/src/components/ProtectedRoute.jsx", "language": "javascript", "content": protected_route_code()},
-            {"path": "frontend/src/lib/auth.js", "language": "javascript", "content": auth_client_code()},
-            {"path": "backend/auth.py", "language": "python", "content": generated_auth_backend_code(persistence)},
+            {"path": "frontend/src/lib/auth.js", "language": "javascript", "content": auth_code()},
         ]
+
+    if "storage" in systems:
+        files.append({"path": "frontend/src/hooks/useItems.js", "language": "javascript", "content": use_items_hook_code()})
 
     if builder_mode == "battery-planner":
-        files.append({"path": "frontend/src/lib/batteryMath.js", "language": "javascript", "content": battery_math_code()})
+        files += [
+            {"path": "frontend/src/lib/batteryMath.js", "language": "javascript", "content": battery_math_code()},
+            {"path": "frontend/src/components/ApplianceTable.jsx", "language": "javascript", "content": appliance_table_code()},
+        ]
 
-    if persistence == "supabase":
-        files.append({"path": "backend/supabase_schema.sql", "language": "sql", "content": generated_supabase_schema()})
-
-    meta = {
-        "app_type": app_type,
-        "builder_mode": builder_mode,
-        "systems": systems,
-        "persistence": persistence,
-        "complexity": complexity,
-        "file_count": len(files),
-    }
-    files.append({"path": ".builder-meta.json", "language": "json", "content": str(meta).replace("'", '"')})
+    if persistence == "sqlite":
+        files.append({"path": "backend/data_store.py", "language": "python", "content": sqlite_backend_store_code()})
+    elif persistence == "supabase":
+        files.append({"path": "backend/data_store.py", "language": "python", "content": supabase_backend_store_code()})
+        files.append({"path": "backend/supabase_schema.sql", "language": "sql", "content": supabase_schema_code()})
+    else:
+        files.append({"path": "backend/data_store.py", "language": "python", "content": localstorage_backend_store_code()})
 
     return files
-
-
-# ---------- system-safe mutation helpers ----------
-def classify_mutation_scope(prompt: str, systems: List[str]) -> str:
-    p = prompt.lower()
-    if re.search(r"(color|theme|dark mode|light mode|spacing|font|ui|style|responsive|mobile)", p):
-        return "ui-only"
-    if re.search(r"(login|register|auth|account|session|protected route)", p):
-        return "auth-only"
-    if re.search(r"(database|storage|save|history|records|api|endpoint|crud)", p):
-        return "data-only"
-    if re.search(r"(route|page|navigation|sidebar|dashboard)", p):
-        return "navigation-and-pages"
-    if len(systems) > 2:
-        return "multi-system"
-    return "targeted"
-
-
-def detect_target_systems(prompt: str, fallback_systems: List[str]) -> List[str]:
-    p = prompt.lower()
-    targets: List[str] = []
-    checks = [
-        ("auth", r"(auth|login|register|account|user|session|protected)"),
-        ("storage", r"(storage|database|save|saved|history|records|crud|api|endpoint)"),
-        ("billing", r"(billing|stripe|subscription|paywall|plan|pricing)"),
-        ("ai-tools", r"(ai|scan|diagnostic|chat|assistant|vision|openai)"),
-        ("settings", r"(settings|profile|preferences)"),
-        ("dashboard", r"(dashboard|sidebar|navigation|layout|page|pages)"),
-    ]
-    for name, pattern in checks:
-        if re.search(pattern, p):
-            targets.append(name)
-    if re.search(r"(theme|dark mode|light mode|responsive|mobile|style|spacing|font|ui)", p):
-        targets.append("ui")
-    # keep targets that exist or are ui
-    final = []
-    for t in targets:
-        if t == "ui" or t in fallback_systems or t in {"dashboard", "settings", "auth", "storage", "billing", "ai-tools"}:
-            final.append(t)
-    return sorted(set(final)) or ["ui"]
-
-
-def build_preserve_rules(systems: List[str], target_systems: List[str], protected_systems: List[str]) -> Dict[str, Any]:
-    protected = sorted(set(protected_systems + [s for s in systems if s not in target_systems and s != "ui"]))
-    file_patterns = [
-        "frontend/src/lib/api.js",
-        "backend/main.py",
-        "README.md",
-        ".builder-meta.json",
-    ]
-    if "auth" in protected:
-        file_patterns += [
-            "frontend/src/lib/auth.js",
-            "frontend/src/components/ProtectedRoute.jsx",
-            "frontend/src/pages/LoginPage.jsx",
-            "frontend/src/pages/RegisterPage.jsx",
-            "backend/auth.py",
-        ]
-    if "storage" in protected:
-        file_patterns += [
-            "backend/data_store.py",
-            "backend/database.py",
-            "backend/supabase_schema.sql",
-            "frontend/src/lib/api.js",
-        ]
-    return {
-        "protected_systems": protected,
-        "preserve_file_patterns": sorted(set(file_patterns)),
-        "forbidden_operations": ["delete-protected-files", "rewrite-unrelated-systems", "drop-routes-without-replacement"],
-    }
-
-
-def build_safe_file_operations(prompt: str, app_type: str, target_systems: List[str], systems: List[str]) -> List[Dict[str, Any]]:
-    p = prompt.lower()
-    ops: List[Dict[str, Any]] = []
-    if "ui" in target_systems:
-        ops += [
-            {"type": "update", "path": "frontend/src/styles/app.css", "reason": "apply style-safe mutation", "system": "ui"},
-            {"type": "update", "path": "frontend/src/App.jsx", "reason": "adjust shell or routing wrappers without deleting core systems", "system": "ui"},
-        ]
-    if "auth" in target_systems:
-        ops += [
-            {"type": "update", "path": "frontend/src/lib/auth.js", "reason": "adjust auth client safely", "system": "auth"},
-            {"type": "update", "path": "frontend/src/components/ProtectedRoute.jsx", "reason": "preserve route protection while mutating auth", "system": "auth"},
-            {"type": "update", "path": "backend/auth.py", "reason": "mutate auth backend only", "system": "auth"},
-        ]
-    if "storage" in target_systems:
-        ops += [
-            {"type": "update", "path": "frontend/src/lib/api.js", "reason": "extend api client safely", "system": "storage"},
-            {"type": "update", "path": "backend/data_store.py", "reason": "preserve persistence while changing data flow", "system": "storage"},
-            {"type": "update", "path": "backend/main.py", "reason": "add or extend CRUD endpoints only", "system": "storage"},
-        ]
-    if "dashboard" in target_systems or re.search(r"(page|pages|sidebar|dashboard|navigation)", p):
-        page_path = {
-            "admin panel": "frontend/src/pages/DashboardPage.jsx",
-            "assistant app": "frontend/src/pages/AssistantPage.jsx",
-            "content app": "frontend/src/pages/StudioPage.jsx",
-            "tool app": "frontend/src/pages/ToolPage.jsx",
-        }.get(app_type, "frontend/src/pages/ToolPage.jsx")
-        ops += [
-            {"type": "update", "path": page_path, "reason": "mutate primary page without touching unrelated systems", "system": "dashboard"},
-            {"type": "update", "path": "frontend/src/App.jsx", "reason": "preserve routes while adding page-level changes", "system": "dashboard"},
-        ]
-    if "billing" in target_systems:
-        ops += [
-            {"type": "create_or_update", "path": "frontend/src/pages/BillingPage.jsx", "reason": "add billing ui safely", "system": "billing"},
-            {"type": "create_or_update", "path": "backend/billing.py", "reason": "add billing backend without touching auth or storage", "system": "billing"},
-        ]
-    if "ai-tools" in target_systems:
-        ops += [
-            {"type": "create_or_update", "path": "frontend/src/pages/ScanPage.jsx", "reason": "add ai feature surface safely", "system": "ai-tools"},
-            {"type": "create_or_update", "path": "backend/ai_tools.py", "reason": "isolate ai backend changes", "system": "ai-tools"},
-        ]
-    if not ops:
-        ops = [{"type": "update", "path": "frontend/src/App.jsx", "reason": "generic safe mutation fallback", "system": "ui"}]
-    return ops
-
-
-def build_mutation_guardrails(scope: str, target_systems: List[str], preserve_rules: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "mode": "system-safe",
-        "scope": scope,
-        "target_systems": target_systems,
-        "must_preserve": preserve_rules["preserve_file_patterns"],
-        "must_not_break": [
-            "existing routes remain reachable",
-            "auth flows remain intact unless auth is targeted",
-            "persistence layer remains compatible unless storage is targeted",
-            "api client contracts stay stable unless storage is targeted",
-        ],
-        "recommended_apply_order": [
-            "analyze-target-systems",
-            "lock-protected-files",
-            "patch-target-files",
-            "verify-routes",
-            "verify-auth-and-data-flow",
-        ],
-    }
 
 
 @app.post("/mutate")
@@ -1455,9 +1302,9 @@ def mutate(payload: MutateRequest):
     app_type = infer_app_type(prompt)
     builder_mode = infer_builder_mode(prompt)
     summary_style = infer_summary_style(prompt)
-    systems = infer_systems(prompt, app_type, payload.systems)
-    persistence = infer_persistence(prompt, systems, payload.complexity, "")
-    modules = recommend_modules(prompt, app_type, systems)
+    systems = payload.systems or infer_systems(prompt, app_type)
+    persistence = infer_persistence(prompt, systems, payload.complexity or "mvp")
+    modules = recommend_modules(prompt, app_type)
     layout = build_layout(prompt, payload.current_layout)
     file_tree = build_file_tree(app_type, builder_mode, prompt, systems, persistence)
     routes = build_routes(app_type, prompt, systems)
@@ -1480,9 +1327,8 @@ def mutate(payload: MutateRequest):
         "mutation_summary": summary,
         "next_best_actions": [
             "materialize files",
-            "generate auth system",
+            "wire api data flow",
             "regenerate routes",
-            "connect persistence",
             "generate code",
         ],
     }
@@ -1493,10 +1339,12 @@ def generate_code(payload: GenerateCodeRequest):
     prompt = payload.prompt.strip()
     app_type = payload.app_type or infer_app_type(prompt)
     builder_mode = payload.builder_mode or infer_builder_mode(prompt)
+    systems = payload.systems or infer_systems(prompt, app_type)
     style = payload.style or "dark glass"
-    systems = infer_systems(prompt, app_type, payload.systems)
-    persistence = infer_persistence(prompt, systems, payload.complexity, payload.persistence)
-    files = generate_code_bundle(prompt, app_type, builder_mode, style, systems, persistence, payload.complexity)
+    complexity = payload.complexity or "mvp"
+    persistence = payload.persistence or infer_persistence(prompt, systems, complexity)
+
+    files = generate_code_bundle(prompt, app_type, builder_mode, style, systems, persistence)
     routes = payload.routes or build_routes(app_type, prompt, systems)
     components = payload.components or build_components(app_type, systems)
 
@@ -1507,400 +1355,194 @@ def generate_code(payload: GenerateCodeRequest):
         "builder_mode": builder_mode,
         "style": style,
         "systems": systems,
+        "complexity": complexity,
         "persistence": persistence,
-        "complexity": payload.complexity,
+        "files": files,
         "generated_files": files,
-        "files": files,
         "routes": routes,
         "components": components,
         "entry_file": "frontend/src/main.jsx",
         "app_file": "frontend/src/App.jsx",
-        "summary": f"Generated {len(files)} files for a {app_type} in {builder_mode} mode with {', '.join(systems) if systems else 'base systems'} and {persistence} persistence.",
-    }
-
-
-# ---------- idea-to-app orchestration ----------
-from uuid import uuid4
-from datetime import datetime
-
-
-class OrchestrateRequest(BaseModel):
-    prompt: str
-    project_id: str = ""
-    mode: str = "auto"  # auto | create | update
-    current_files: List[Dict[str, Any]] = Field(default_factory=list)
-    systems: List[str] = Field(default_factory=list)
-    complexity: str = "mvp"
-    style: str = "dark glass"
-    architecture: Dict[str, Any] = Field(default_factory=dict)
-    app_type: str = ""
-    builder_mode: str = ""
-    persistence: str = ""
-    routes: List[Dict[str, Any]] = Field(default_factory=list)
-    components: List[Dict[str, Any]] = Field(default_factory=list)
-
-
-PROJECT_STORE: Dict[str, Dict[str, Any]] = {}
-
-
-def now_iso() -> str:
-    return datetime.utcnow().isoformat() + "Z"
-
-
-def normalize_file_list(files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    cleaned: List[Dict[str, Any]] = []
-    seen = set()
-    for item in files or []:
-        path = str(item.get("path", "")).strip()
-        if not path:
-            continue
-        key = path.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        cleaned.append(
-            {
-                "path": path,
-                "language": item.get("language", infer_language_from_path(path)),
-                "content": item.get("content", ""),
-            }
-        )
-    return cleaned
-
-
-def infer_language_from_path(path: str) -> str:
-    lower = path.lower()
-    if lower.endswith(".py"):
-        return "python"
-    if lower.endswith(".jsx") or lower.endswith(".js"):
-        return "javascript"
-    if lower.endswith(".css"):
-        return "css"
-    if lower.endswith(".json"):
-        return "json"
-    if lower.endswith(".md"):
-        return "markdown"
-    if lower.endswith(".html"):
-        return "html"
-    if lower.endswith(".sql"):
-        return "sql"
-    return "text"
-
-
-def infer_complexity(prompt: str, requested: str = "") -> str:
-    value = (requested or "").strip().lower()
-    if value in {"starter", "mvp", "product"}:
-        return value
-    p = prompt.lower()
-    if re.search(r"(complete app|full app|production|product|saas|portal|platform|multi page|multi-page)", p):
-        return "product"
-    if re.search(r"(prototype|starter|simple app|simple tool|quick demo)", p):
-        return "starter"
-    return "mvp"
-
-
-def default_architecture(app_type: str, systems: List[str], persistence: str) -> Dict[str, Any]:
-    frontend = "react-vite"
-    backend = "fastapi"
-    state = "local project state"
-    auth = "jwt" if "auth" in systems else "none"
-    if persistence == "supabase":
-        state = "supabase"
-        auth = "supabase+jwt" if "auth" in systems else "supabase"
-    elif persistence == "sqlite":
-        state = "sqlite+api"
-    elif persistence == "localstorage":
-        state = "localstorage"
-    return {
-        "frontend": frontend,
-        "backend": backend,
-        "state": state,
-        "auth": auth,
-        "app_shell": app_type,
-    }
-
-
-def choose_orchestration_mode(requested_mode: str, project_id: str, existing: Dict[str, Any]) -> str:
-    mode = (requested_mode or "auto").strip().lower()
-    if mode in {"create", "update"}:
-        return mode
-    if project_id and existing:
-        return "update"
-    return "create"
-
-
-def merge_architecture(existing: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
-    merged = dict(existing or {})
-    for key, value in (incoming or {}).items():
-        if value not in ("", None, [], {}):
-            merged[key] = value
-    return merged
-
-
-def make_project_name(prompt: str, app_type: str) -> str:
-    text = re.sub(r"[^a-zA-Z0-9\s-]", "", prompt).strip()
-    parts = [p for p in text.split() if p][:6]
-    if not parts:
-        parts = app_type.split()
-    return " ".join(word.capitalize() for word in parts)[:60] or "Generated App"
-
-
-def slugify_name(name: str) -> str:
-    value = re.sub(r"[^a-zA-Z0-9]+", "-", name.strip().lower()).strip("-")
-    return value or "generated-app"
-
-
-def build_preview_model(app_type: str, systems: List[str], routes: List[Dict[str, Any]], files: List[Dict[str, Any]]) -> Dict[str, Any]:
-    page_paths = [r.get("path", "/") for r in routes]
-    key_files = [f.get("path", "") for f in files[:12]]
-    return {
-        "shell": app_type,
-        "routes": page_paths,
-        "systems": systems,
-        "key_files": key_files,
-        "preview_ready": True,
-    }
-
-
-def build_project_state_record(
-    *,
-    project_id: str,
-    prompt: str,
-    mode: str,
-    app_type: str,
-    builder_mode: str,
-    systems: List[str],
-    complexity: str,
-    persistence: str,
-    style: str,
-    architecture: Dict[str, Any],
-    routes: List[Dict[str, Any]],
-    components: List[Dict[str, Any]],
-    files: List[Dict[str, Any]],
-    previous_versions: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    project_name = make_project_name(prompt, app_type)
-    return {
-        "project_id": project_id,
-        "project_name": project_name,
-        "project_slug": slugify_name(project_name),
-        "prompt": prompt,
-        "mode": mode,
-        "app_type": app_type,
-        "builder_mode": builder_mode,
-        "systems": systems,
-        "complexity": complexity,
-        "persistence": persistence,
-        "style": style,
-        "architecture": architecture,
-        "routes": routes,
-        "components": components,
-        "files": files,
-        "preview": build_preview_model(app_type, systems, routes, files),
-        "version_count": len(previous_versions) + 1,
-        "updated_at": now_iso(),
-        "versions": previous_versions + [
-            {
-                "version": len(previous_versions) + 1,
-                "prompt": prompt,
-                "updated_at": now_iso(),
-                "file_count": len(files),
-                "systems": list(systems),
-            }
-        ],
-    }
-
-
-def extend_project_from_prompt(base_project: Dict[str, Any], prompt: str) -> Dict[str, Any]:
-    existing_systems = list(base_project.get("systems", []))
-    app_type = base_project.get("app_type") or infer_app_type(prompt)
-    builder_mode = base_project.get("builder_mode") or infer_builder_mode(prompt)
-    extra_systems = infer_systems(prompt, app_type, existing_systems)
-    systems = sorted(set(existing_systems + extra_systems))
-    complexity = infer_complexity(prompt, base_project.get("complexity", "mvp"))
-    persistence = infer_persistence(prompt, systems, complexity, base_project.get("persistence", ""))
-    style = base_project.get("style", "dark glass")
-    architecture = default_architecture(app_type, systems, persistence)
-    architecture = merge_architecture(architecture, base_project.get("architecture", {}))
-    routes = build_routes(app_type, prompt, systems)
-    components = build_components(app_type, systems)
-    files = generate_code_bundle(prompt, app_type, builder_mode, style, systems, persistence, complexity)
-    return {
-        "app_type": app_type,
-        "builder_mode": builder_mode,
-        "systems": systems,
-        "complexity": complexity,
-        "persistence": persistence,
-        "style": style,
-        "architecture": architecture,
-        "routes": routes,
-        "components": components,
-        "files": normalize_file_list(files),
-    }
-
-
-def create_project_from_idea(payload: OrchestrateRequest) -> Dict[str, Any]:
-    prompt = payload.prompt.strip()
-    app_type = payload.app_type or infer_app_type(prompt)
-    builder_mode = payload.builder_mode or infer_builder_mode(prompt)
-    systems = infer_systems(prompt, app_type, payload.systems)
-    complexity = infer_complexity(prompt, payload.complexity)
-    persistence = infer_persistence(prompt, systems, complexity, payload.persistence)
-    style = payload.style or "dark glass"
-    architecture = default_architecture(app_type, systems, persistence)
-    architecture = merge_architecture(architecture, payload.architecture)
-    routes = payload.routes or build_routes(app_type, prompt, systems)
-    components = payload.components or build_components(app_type, systems)
-    files = payload.current_files or generate_code_bundle(prompt, app_type, builder_mode, style, systems, persistence, complexity)
-    files = normalize_file_list(files)
-    project_id = payload.project_id or str(uuid4())
-    return build_project_state_record(
-        project_id=project_id,
-        prompt=prompt,
-        mode="create",
-        app_type=app_type,
-        builder_mode=builder_mode,
-        systems=systems,
-        complexity=complexity,
-        persistence=persistence,
-        style=style,
-        architecture=architecture,
-        routes=routes,
-        components=components,
-        files=files,
-        previous_versions=[],
-    )
-
-
-def update_existing_project(project: Dict[str, Any], payload: OrchestrateRequest) -> Dict[str, Any]:
-    prompt = payload.prompt.strip()
-    extended = extend_project_from_prompt(project, prompt)
-    architecture = merge_architecture(extended["architecture"], payload.architecture)
-    return build_project_state_record(
-        project_id=project["project_id"],
-        prompt=prompt,
-        mode="update",
-        app_type=extended["app_type"],
-        builder_mode=extended["builder_mode"],
-        systems=extended["systems"],
-        complexity=extended["complexity"],
-        persistence=extended["persistence"],
-        style=extended["style"],
-        architecture=architecture,
-        routes=payload.routes or extended["routes"],
-        components=payload.components or extended["components"],
-        files=payload.current_files or extended["files"],
-        previous_versions=project.get("versions", []),
-    )
-
-
-@app.post("/orchestrate")
-def orchestrate(payload: OrchestrateRequest):
-    prompt = payload.prompt.strip()
-    existing = PROJECT_STORE.get(payload.project_id, {}) if payload.project_id else {}
-    mode = choose_orchestration_mode(payload.mode, payload.project_id, existing)
-
-    if mode == "create":
-        project = create_project_from_idea(payload)
-    else:
-        if not existing:
-            project = create_project_from_idea(payload)
-            mode = "create"
-        else:
-            project = update_existing_project(existing, payload)
-
-    PROJECT_STORE[project["project_id"]] = project
-
-    orchestration_summary = [
-        f"Mode: {mode}",
-        f"App type: {project['app_type']}",
-        f"Builder mode: {project['builder_mode']}",
-        f"Systems: {', '.join(project['systems']) or 'none'}",
-        f"Persistence: {project['persistence']}",
-        f"Complexity: {project['complexity']}",
-        f"Files ready: {len(project['files'])}",
-        f"Project versions: {project['version_count']}",
-    ]
-
-    return {
-        "ok": True,
-        "project_id": project["project_id"],
-        "project_name": project["project_name"],
-        "project_slug": project["project_slug"],
-        "mode": mode,
-        "prompt": prompt,
-        "app_type": project["app_type"],
-        "builder_mode": project["builder_mode"],
-        "systems": project["systems"],
-        "complexity": project["complexity"],
-        "persistence": project["persistence"],
-        "style": project["style"],
-        "architecture": project["architecture"],
-        "routes": project["routes"],
-        "components": project["components"],
-        "files": project["files"],
-        "generated_files": project["files"],
-        "entry_file": "frontend/src/main.jsx",
-        "app_file": "frontend/src/App.jsx",
-        "preview": project["preview"],
-        "project_state": {
-            "project_id": project["project_id"],
-            "version_count": project["version_count"],
-            "updated_at": project["updated_at"],
-            "systems": project["systems"],
-            "persistence": project["persistence"],
+        "backend_entry": "backend/main.py",
+        "data_flow": {
+            "frontend_client": "frontend/src/lib/api.js",
+            "backend_routes": ["GET /api/items", "POST /api/items", "PUT /api/items/{id}", "DELETE /api/items/{id}"],
+            "storage_file": "backend/data_store.py",
         },
-        "orchestration_summary": orchestration_summary,
-        "next_best_actions": [
-            "preview current app",
-            "apply focused mutation",
-            "download project zip",
-            "add deploy configuration",
-        ],
+        "summary": f"Generated {len(files)} files for a {app_type} in {builder_mode} mode with {persistence} persistence and live data flow.",
     }
 
 
-@app.get("/project-state/{project_id}")
-def project_state(project_id: str):
-    project = PROJECT_STORE.get(project_id)
-    if not project:
-        return {"ok": False, "error": "project_not_found", "project_id": project_id}
+def _preview_escape(value: Any) -> str:
+    return str(value or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _preview_routes(payload: PreviewRunRequest) -> List[Dict[str, str]]:
+    if payload.routes:
+        return [
+            {
+                "path": route.get("path") or f"/route-{index + 1}",
+                "component": route.get("component") or "Page",
+            }
+            for index, route in enumerate(payload.routes)
+        ]
+    inferred = []
+    for file in payload.files:
+        path = str(file.get("path", ""))
+        if re.search(r"src/pages/.+\.(jsx|js|tsx|ts)$", path):
+            name = path.split("/")[-1].rsplit(".", 1)[0]
+            slug = re.sub(r"([a-z0-9])([A-Z])", r"\1-\2", re.sub(r"Page$", "", name, flags=re.I)).lower()
+            inferred.append({"path": f"/{slug or 'page'}", "component": name})
+    if inferred:
+        return inferred
+    app_type = payload.app_type
+    default_path = "/dashboard" if app_type == "admin panel" else "/assistant" if app_type == "assistant app" else "/studio" if app_type == "content app" else "/tool"
+    return [{"path": default_path, "component": "App"}]
+
+
+def _preview_auth_label(payload: PreviewRunRequest) -> str:
+    all_text = " ".join(
+        [payload.prompt, payload.app_type, payload.builder_mode]
+        + [str(f.get("path", "")) for f in payload.files]
+        + payload.systems
+    ).lower()
+    enabled = bool(re.search(r"(auth|login|register|signin|token|jwt|session|profile)", all_text))
+    has_admin = bool(re.search(r"(admin|portal|dealer|technician|staff|role)", all_text))
+    if not enabled:
+        return "Guest preview"
+    if payload.auth_mode == "admin" and has_admin:
+        return "Admin runtime"
+    if payload.auth_mode == "member":
+        return "Member runtime"
+    return "Auth enabled"
+
+
+def _build_preview_html(payload: PreviewRunRequest) -> str:
+    routes = _preview_routes(payload)
+    current = next((route for route in routes if route["path"] == payload.route), routes[0] if routes else {"path": "/", "component": "App"})
+    file_cards = "".join(
+        f'<div class="file-card"><strong>{_preview_escape(file.get("path"))}</strong><span>{_preview_escape(file.get("language", "code"))}</span></div>'
+        for file in payload.files[:10]
+    ) or '<div class="empty-card">No files in session.</div>'
+    route_cards = "".join(
+        f'<div class="route-pill{" active" if route["path"] == current["path"] else ""}">{_preview_escape(route["path"])}</div>'
+        for route in routes
+    )
+    auth_label = _preview_auth_label(payload)
+    prompt = _preview_escape(payload.prompt or "Generated app")
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Runtime Sandbox</title>
+  <style>
+    :root {{ color-scheme: dark; --bg:#07111f; --panel:rgba(13,25,43,.92); --border:rgba(148,163,184,.16); --text:#e5eefc; --muted:#93a4bf; --accent:#66d9ef; --accent2:#8b5cf6; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; font-family:Inter,system-ui,Arial,sans-serif; background:radial-gradient(circle at top,#12203a,#07111f 55%); color:var(--text); }}
+    .shell {{ min-height:100vh; padding:24px; display:grid; gap:18px; }}
+    .panel {{ border:1px solid var(--border); background:var(--panel); border-radius:20px; padding:18px; }}
+    .hero {{ display:grid; gap:12px; }}
+    .tag-row,.routes,.file-grid {{ display:flex; gap:8px; flex-wrap:wrap; }}
+    .tag,.route-pill,.file-card {{ border:1px solid rgba(148,163,184,.16); border-radius:14px; background:rgba(255,255,255,.04); }}
+    .tag,.route-pill {{ padding:8px 12px; color:var(--muted); }}
+    .route-pill.active {{ background:linear-gradient(135deg,var(--accent),var(--accent2)); color:#07111f; font-weight:700; }}
+    .grid {{ display:grid; grid-template-columns:1.05fr .95fr; gap:18px; }}
+    .file-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); }}
+    .file-card {{ padding:14px; display:grid; gap:6px; }}
+    .file-card span,.muted {{ color:var(--muted); }}
+    .frame {{ min-height:320px; border-radius:18px; padding:18px; background:rgba(255,255,255,.03); border:1px dashed rgba(148,163,184,.18); display:grid; gap:12px; }}
+    .windowbar {{ display:flex; gap:8px; }}
+    .windowbar span {{ width:10px; height:10px; border-radius:999px; background:rgba(255,255,255,.28); display:inline-block; }}
+    .cta {{ display:inline-flex; align-items:center; justify-content:center; border:none; border-radius:999px; padding:12px 18px; font-weight:700; background:linear-gradient(135deg,var(--accent),var(--accent2)); color:#07111f; }}
+    @media (max-width: 900px) {{ .grid {{ grid-template-columns:1fr; }} }}
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <section class="panel hero">
+      <div class="tag-row">
+        <div class="tag">Phase 1 runtime sandbox</div>
+        <div class="tag">{_preview_escape(payload.app_type or "app")}</div>
+        <div class="tag">{_preview_escape(payload.builder_mode or "builder")}</div>
+        <div class="tag">{_preview_escape(auth_label)}</div>
+      </div>
+      <h1 style="margin:0;">{prompt}</h1>
+      <div class="routes">{route_cards}</div>
+    </section>
+
+    <div class="grid">
+      <section class="panel">
+        <div class="frame">
+          <div class="windowbar"><span></span><span></span><span></span></div>
+          <strong>{_preview_escape(current.get("component", "Page"))}</strong>
+          <div class="muted">Current route: {_preview_escape(current.get("path", "/"))}</div>
+          <p class="muted">This lightweight sandbox is backend-managed and session-based. It is designed to feel more like a running preview loop before a full npm/dev-server sandbox.</p>
+          <button class="cta">Primary action</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2 style="margin-top:0;">Files in sandbox</h2>
+        <div class="file-grid">{file_cards}</div>
+      </section>
+    </div>
+  </div>
+</body>
+</html>"""
+
+
+@app.post("/preview/run")
+def preview_run(payload: PreviewRunRequest):
+    session_id = payload.session_id or str(uuid.uuid4())
+    html = _build_preview_html(payload)
+    _PREVIEW_SESSIONS[session_id] = {
+        "session_id": session_id,
+        "project_id": payload.project_id,
+        "status": "ready",
+        "route": payload.route or "/",
+        "auth_mode": payload.auth_mode or "guest",
+        "file_count": len(payload.files),
+        "updated_at": int(time.time()),
+        "preview_html": html,
+    }
     return {
         "ok": True,
-        "project_id": project["project_id"],
-        "project_name": project["project_name"],
-        "project_slug": project["project_slug"],
-        "app_type": project["app_type"],
-        "builder_mode": project["builder_mode"],
-        "systems": project["systems"],
-        "complexity": project["complexity"],
-        "persistence": project["persistence"],
-        "style": project["style"],
-        "architecture": project["architecture"],
-        "routes": project["routes"],
-        "components": project["components"],
-        "files": project["files"],
-        "preview": project["preview"],
-        "versions": project["versions"],
-        "updated_at": project["updated_at"],
+        "session_id": session_id,
+        "status": "ready",
+        "route": payload.route or "/",
+        "auth_mode": payload.auth_mode or "guest",
+        "file_count": len(payload.files),
+        "preview_url": f"/preview/session/{session_id}",
     }
 
 
-@app.get("/projects")
-def list_projects():
-    items = []
-    for project in PROJECT_STORE.values():
-        items.append(
-            {
-                "project_id": project["project_id"],
-                "project_name": project["project_name"],
-                "project_slug": project["project_slug"],
-                "app_type": project["app_type"],
-                "systems": project["systems"],
-                "persistence": project["persistence"],
-                "version_count": project["version_count"],
-                "updated_at": project["updated_at"],
-            }
-        )
-    items.sort(key=lambda item: item["updated_at"], reverse=True)
-    return {"ok": True, "count": len(items), "projects": items}
+@app.get("/preview/status/{session_id}")
+def preview_status(session_id: str):
+    session = _PREVIEW_SESSIONS.get(session_id)
+    if not session:
+        return {"ok": False, "status": "missing", "session_id": session_id}
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "status": session.get("status", "ready"),
+        "route": session.get("route", "/"),
+        "auth_mode": session.get("auth_mode", "guest"),
+        "file_count": session.get("file_count", 0),
+        "preview_url": f"/preview/session/{session_id}",
+        "updated_at": session.get("updated_at"),
+    }
+
+
+@app.post("/preview/reset")
+def preview_reset(payload: PreviewResetRequest):
+    removed = _PREVIEW_SESSIONS.pop(payload.session_id, None)
+    return {"ok": True, "removed": bool(removed), "session_id": payload.session_id}
+
+
+@app.get("/preview/session/{session_id}", response_class=HTMLResponse)
+def preview_session(session_id: str):
+    session = _PREVIEW_SESSIONS.get(session_id)
+    if not session:
+        return HTMLResponse("<h1>Sandbox session not found</h1>", status_code=404)
+    return HTMLResponse(session.get("preview_html", "<h1>Empty sandbox session</h1>"))
