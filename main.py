@@ -5,14 +5,6 @@ from typing import List, Dict, Any, Optional
 import re
 import json
 
-import os
-import time
-import uuid
-import shutil
-import subprocess
-from pathlib import Path
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
-
 app = FastAPI(title="Builder Backend v6 - Data Flow Generator")
 
 app.add_middleware(
@@ -35,14 +27,7 @@ def home():
 
 @app.get("/health")
 def health():
-    return {
-        "status": "healthy",
-        "service": "builder-backend-v6",
-        "data_flow": True,
-        "runtime_sandbox": True,
-        "preview_sessions": len(_PREVIEW_SESSIONS) if "_PREVIEW_SESSIONS" in globals() else 0,
-        "preview_root": os.getenv("BUILDER_PREVIEW_ROOT", "/tmp/builder_preview_sandbox"),
-    }
+    return {"status": "healthy", "service": "builder-backend-v6", "data_flow": True, "rv_monetization": True}
 
 
 class ApplianceItem(BaseModel):
@@ -80,6 +65,87 @@ class GenerateCodeRequest(BaseModel):
     complexity: str = "mvp"
     architecture: Dict[str, Any] = Field(default_factory=dict)
     persistence: str = ""
+
+class RvMonetizationRequest(BaseModel):
+    template_key: str = "rv_power"
+    camping_profile: str = "weekend"
+    battery_ah: float = 0
+    solar_watts: float = 0
+    inverter_watts: float = 0
+    monthly_price: float = 9.99
+    yearly_price: float = 69.99
+    affiliate_tag_ca: str = "rvinspector03-20"
+    affiliate_tag_us: str = "rvinspectorpr-20"
+
+
+
+def build_rv_monetization_plan(template_key: str, camping_profile: str, battery_ah: float, solar_watts: float, inverter_watts: float, monthly_price: float, yearly_price: float, affiliate_tag_ca: str, affiliate_tag_us: str) -> Dict[str, Any]:
+    battery_ah = max(battery_ah, 0)
+    solar_watts = max(solar_watts, 0)
+    inverter_watts = max(inverter_watts, 0)
+    featured_products = []
+    if battery_ah >= 170:
+        featured_products.append({"title": "200Ah LiFePO4 Battery Bank", "slug": "200ah-lifepo4-battery-bank"})
+    elif battery_ah >= 90:
+        featured_products.append({"title": "100Ah LiFePO4 Battery", "slug": "100ah-lifepo4-battery"})
+    if solar_watts >= 360:
+        featured_products.append({"title": "400W Solar Expansion Kit", "slug": "400w-solar-expansion-kit"})
+    elif solar_watts >= 180:
+        featured_products.append({"title": "200W Solar Starter Kit", "slug": "200w-solar-starter-kit"})
+    if inverter_watts >= 2400:
+        featured_products.append({"title": "3000W Pure Sine Inverter", "slug": "3000w-pure-sine-inverter"})
+    elif inverter_watts >= 1500:
+        featured_products.append({"title": "2000W Pure Sine Inverter", "slug": "2000w-pure-sine-inverter"})
+    featured_products.append({"title": "Battery Monitor + Shunt", "slug": "battery-monitor-shunt"})
+
+    profile_label = {
+        "weekend": "Weekend",
+        "boondock": "Boondock",
+        "summer": "Hot Weather",
+        "shoulder": "Shoulder Season",
+    }.get(camping_profile, camping_profile.title() or "Weekend")
+    estimated_aov = max(199, round((battery_ah * 1.2) + (solar_watts * 0.35) + (inverter_watts * 0.12)))
+    commission_low = round(estimated_aov * 0.03)
+    commission_high = round(estimated_aov * 0.06)
+    return {
+        "template_key": template_key,
+        "camping_profile": profile_label,
+        "subscription": {
+            "monthly_price": monthly_price,
+            "yearly_price": yearly_price,
+            "trial_days": 7,
+            "positioning": f"Offer saved plans, premium RV guidance, and exported reports for ${monthly_price:.2f}/mo or ${yearly_price:.2f}/yr.",
+        },
+        "affiliate": {
+            "affiliate_tag_ca": affiliate_tag_ca,
+            "affiliate_tag_us": affiliate_tag_us,
+            "estimated_commission_range": f"${commission_low}-${commission_high}",
+            "featured_products": featured_products,
+        },
+        "paywall_hooks": [
+            "Saved RV plans and scan history",
+            "Printable premium export",
+            "Advanced diagnostics / sizing guidance",
+        ],
+    }
+
+
+@app.post("/rv-monetization-plan")
+def rv_monetization_plan(payload: RvMonetizationRequest):
+    return {
+        "ok": True,
+        "monetization": build_rv_monetization_plan(
+            payload.template_key,
+            payload.camping_profile,
+            payload.battery_ah,
+            payload.solar_watts,
+            payload.inverter_watts,
+            payload.monthly_price,
+            payload.yearly_price,
+            payload.affiliate_tag_ca,
+            payload.affiliate_tag_us,
+        ),
+    }
 
 
 @app.post("/battery-plan")
@@ -1340,6 +1406,18 @@ def generate_code(payload: GenerateCodeRequest):
     routes = payload.routes or build_routes(app_type, prompt, systems)
     components = payload.components or build_components(app_type, systems)
 
+    monetization = build_rv_monetization_plan(
+        "rv_power" if builder_mode == "battery-planner" else "rv_diagnostics" if "ai-tools" in systems else "rv_maintenance",
+        "weekend",
+        180 if builder_mode == "battery-planner" else 120,
+        400 if builder_mode == "battery-planner" else 220,
+        2000 if builder_mode == "battery-planner" else 1500,
+        9.99,
+        69.99,
+        "rvinspector03-20",
+        "rvinspectorpr-20",
+    )
+
     return {
         "ok": True,
         "prompt": prompt,
@@ -1361,455 +1439,6 @@ def generate_code(payload: GenerateCodeRequest):
             "backend_routes": ["GET /api/items", "POST /api/items", "PUT /api/items/{id}", "DELETE /api/items/{id}"],
             "storage_file": "backend/data_store.py",
         },
+        "monetization": monetization,
         "summary": f"Generated {len(files)} files for a {app_type} in {builder_mode} mode with {persistence} persistence and live data flow.",
     }
-
-
-# ===== Runtime Sandbox Phase 3 =====
-
-class PreviewRunRequest(BaseModel):
-    session_id: Optional[str] = None
-    project_id: Optional[str] = None
-    prompt: str = ""
-    app_type: str = ""
-    builder_mode: str = ""
-    route: str = "/"
-    auth_mode: str = "guest"
-    files: List[Dict[str, Any]] = Field(default_factory=list)
-    routes: List[Dict[str, Any]] = Field(default_factory=list)
-    components: List[Dict[str, Any]] = Field(default_factory=list)
-    systems: List[str] = Field(default_factory=list)
-
-class PreviewResetRequest(BaseModel):
-    session_id: str
-
-_PREVIEW_SESSIONS: Dict[str, Dict[str, Any]] = {}
-
-def _cleanup_preview_sessions(max_age_seconds: int = 3600 * 6, keep_latest: int = 20) -> None:
-    now_ts = int(time.time())
-    items = sorted(_PREVIEW_SESSIONS.items(), key=lambda item: item[1].get("updated_at", 0), reverse=True)
-    keep_ids = {session_id for session_id, _ in items[:keep_latest]}
-    for session_id, session in list(_PREVIEW_SESSIONS.items()):
-        age = now_ts - int(session.get("updated_at", now_ts))
-        if session_id in keep_ids and age < max_age_seconds:
-            continue
-        if age >= max_age_seconds or session_id not in keep_ids:
-            _PREVIEW_SESSIONS.pop(session_id, None)
-            shutil.rmtree(_preview_root() / session_id, ignore_errors=True)
-
-def _safe_session_id(raw_value: Optional[str]) -> str:
-    cleaned = re.sub(r"[^a-zA-Z0-9_-]", "", str(raw_value or ""))[:64]
-    return cleaned or str(uuid.uuid4())
-
-def _read_json_file(path: Path, fallback: Dict[str, Any]) -> Dict[str, Any]:
-    try:
-        if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return fallback
-
-def _error_hint(errors: List[str], logs: List[str]) -> str:
-    joined = " ".join(errors + logs).lower()
-    if "npm install failed" in joined:
-        return "Dependency install failed. Try Recover sandbox to re-write the temp project and rebuild."
-    if "npm run build failed" in joined or "build failed" in joined:
-        return "Frontend build failed. Open logs to inspect the Vite/React error, then Recover sandbox after the fix."
-    if "package.json not found" in joined:
-        return "The generated files do not include a runnable frontend package yet. Regenerate code before rerunning the sandbox."
-    if "npm was not found" in joined:
-        return "The server runtime cannot run npm. The sandbox will stay in fallback preview mode until npm is available."
-    return "Use Recover sandbox first. If that fails, inspect logs and fall back to the in-browser preview."
-
-def _preview_root() -> Path:
-    root = Path(os.getenv("BUILDER_PREVIEW_ROOT", "/tmp/builder_preview_sandbox"))
-    root.mkdir(parents=True, exist_ok=True)
-    return root
-
-def _session_dir(session_id: str) -> Path:
-    path = _preview_root() / session_id
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-def _safe_preview_relpath(raw_path: str) -> str:
-    clean = str(raw_path or "").replace("\\", "/").lstrip("/")
-    parts = [p for p in clean.split("/") if p not in ("", ".", "..")]
-    return "/".join(parts) or "file.txt"
-
-def _write_preview_project(session_id: str, files: List[Dict[str, Any]]) -> Dict[str, Any]:
-    session_dir = _session_dir(session_id)
-    project_dir = session_dir / "project"
-    if project_dir.exists():
-        shutil.rmtree(project_dir, ignore_errors=True)
-    project_dir.mkdir(parents=True, exist_ok=True)
-    written = []
-    for index, file in enumerate(files):
-        rel_path = _safe_preview_relpath(file.get("path") or f"file-{index + 1}.txt")
-        target = project_dir / rel_path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        content = file.get("content")
-        text = content if isinstance(content, str) else str(content or "")
-        target.write_text(text, encoding="utf-8")
-        written.append({
-            "path": rel_path,
-            "size": len(text),
-            "language": file.get("language") or "",
-        })
-    return {"session_dir": str(session_dir), "project_dir": str(project_dir), "files": written}
-
-def _detect_frontend_root(project_dir: Path) -> Path:
-    candidates = [
-        project_dir / "frontend",
-        project_dir,
-    ]
-    for root in candidates:
-        if (root / "package.json").exists():
-            return root
-        if (root / "src" / "main.jsx").exists() or (root / "src" / "main.js").exists() or (root / "src" / "main.tsx").exists() or (root / "src" / "main.ts").exists():
-            return root
-    return project_dir
-
-def _build_preview_html(payload: PreviewRunRequest, session_id: str) -> str:
-    route = payload.route or "/"
-    auth_mode = payload.auth_mode or "guest"
-    files_count = len(payload.files)
-    prompt = payload.prompt or "Generated app preview"
-    return f"""<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>Runtime Sandbox</title>
-    <style>
-      body {{ margin:0; font-family: Inter, system-ui, Arial, sans-serif; background:#08111f; color:#e5eefc; }}
-      .shell {{ min-height:100vh; padding:24px; display:grid; gap:18px; background: radial-gradient(circle at top, #12203a, #07111f 55%); }}
-      .card {{ border:1px solid rgba(148,163,184,.16); border-radius:20px; padding:18px; background:rgba(13,25,43,.88); }}
-      .chips {{ display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }}
-      .chip {{ border:1px solid rgba(148,163,184,.16); border-radius:999px; padding:8px 12px; color:#93a4bf; }}
-      .grid {{ display:grid; gap:16px; grid-template-columns: 1.1fr .9fr; }}
-      .code {{ white-space:pre-wrap; font-size:12px; line-height:1.5; max-height:360px; overflow:auto; border-radius:16px; padding:14px; background:rgba(0,0,0,.24); }}
-      a {{ color:#66d9ef; }}
-      @media (max-width: 900px) {{ .grid {{ grid-template-columns:1fr; }} }}
-    </style>
-  </head>
-  <body>
-    <div class="shell">
-      <div class="card">
-        <div class="chip">Runtime sandbox phase 3</div>
-        <h1 style="margin:12px 0 6px;">{prompt}</h1>
-        <p style="color:#93a4bf;">This sandbox booted route <strong>{route}</strong> in <strong>{auth_mode}</strong> mode for session <strong>{session_id}</strong>.</p>
-        <div class="chips">
-          <span class="chip">Files: {files_count}</span>
-          <span class="chip">Route: {route}</span>
-          <span class="chip">Auth: {auth_mode}</span>
-        </div>
-      </div>
-      <div class="grid">
-        <div class="card">
-          <h2 style="margin-top:0;">Sandbox preview</h2>
-          <p style="color:#93a4bf;">If a static build is available, phase 3 serves it from the same sandbox URL. Otherwise this fallback screen stays live and the logs panel explains what happened.</p>
-        </div>
-        <div class="card">
-          <h2 style="margin-top:0;">Actions</h2>
-          <div class="chips">
-            <a class="chip" href="/preview/manifest/{session_id}" target="_blank" rel="noreferrer">Manifest</a>
-            <a class="chip" href="/preview/logs/{session_id}" target="_blank" rel="noreferrer">Logs</a>
-            <a class="chip" href="/preview/files/{session_id}" target="_blank" rel="noreferrer">Files</a>
-          </div>
-        </div>
-      </div>
-    </div>
-  </body>
-</html>"""
-
-def _run_command(command: List[str], cwd: Path, timeout_seconds: int = 180) -> Dict[str, Any]:
-    try:
-        proc = subprocess.run(
-            command,
-            cwd=str(cwd),
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-        )
-        return {
-            "ok": proc.returncode == 0,
-            "returncode": proc.returncode,
-            "stdout": proc.stdout[-12000:],
-            "stderr": proc.stderr[-12000:],
-            "command": " ".join(command),
-        }
-    except subprocess.TimeoutExpired as exc:
-        return {
-            "ok": False,
-            "returncode": -2,
-            "stdout": (exc.stdout or "")[-12000:] if isinstance(exc.stdout, str) else "",
-            "stderr": (exc.stderr or "")[-12000:] if isinstance(exc.stderr, str) else f"Timed out after {timeout_seconds}s",
-            "command": " ".join(command),
-        }
-    except Exception as exc:
-        return {
-            "ok": False,
-            "returncode": -1,
-            "stdout": "",
-            "stderr": str(exc),
-            "command": " ".join(command),
-        }
-    except Exception as exc:
-        return {
-            "ok": False,
-            "returncode": -1,
-            "stdout": "",
-            "stderr": str(exc),
-            "command": " ".join(command),
-        }
-
-def _build_preview_manifest(payload: PreviewRunRequest, session_id: str, write_result: Dict[str, Any], runtime_mode: str, build_dir: str = "") -> Dict[str, Any]:
-    return {
-        "session_id": session_id,
-        "project_id": payload.project_id,
-        "prompt": payload.prompt,
-        "app_type": payload.app_type,
-        "builder_mode": payload.builder_mode,
-        "route": payload.route or "/",
-        "auth_mode": payload.auth_mode or "guest",
-        "systems": payload.systems,
-        "routes": payload.routes,
-        "components": payload.components,
-        "file_count": len(payload.files),
-        "files": write_result["files"],
-        "project_dir": write_result["project_dir"],
-        "build_dir": build_dir,
-        "runtime_mode": runtime_mode,
-        "updated_at": int(time.time()),
-        "phase": "runtime-sandbox-phase-3",
-    }
-
-def _execute_preview_runtime(session_id: str, payload: PreviewRunRequest, write_result: Dict[str, Any], preserve_last_good: bool = True) -> Dict[str, Any]:
-    project_dir = Path(write_result["project_dir"])
-    frontend_root = _detect_frontend_root(project_dir)
-    session_dir = _session_dir(session_id)
-    last_good_dir = session_dir / "last_good_dist"
-    npm_path = shutil.which("npm")
-    logs = [
-        "Phase 3 sandbox session prepared.",
-        f"Prompt: {payload.prompt or 'No prompt supplied'}",
-        f"Route boot: {payload.route or '/'}",
-        f"Auth mode: {payload.auth_mode or 'guest'}",
-        f"Files written: {len(payload.files)}",
-        f"Frontend root: {frontend_root}",
-    ]
-    runtime_mode = "fallback-html"
-    build_dir = ""
-    errors = []
-
-    if not npm_path:
-        logs.append("npm was not found on the server runtime. Falling back to sandbox HTML shell.")
-        return {"runtime_mode": runtime_mode, "build_dir": build_dir, "logs": logs, "errors": errors}
-
-    package_json = frontend_root / "package.json"
-    if not package_json.exists():
-        logs.append("package.json not found for the frontend root. Falling back to sandbox HTML shell.")
-        return {"runtime_mode": runtime_mode, "build_dir": build_dir, "logs": logs, "errors": errors}
-
-    install_result = _run_command([npm_path, "install", "--no-fund", "--no-audit"], frontend_root, timeout_seconds=240)
-    logs.append(f"$ {install_result['command']}")
-    if install_result["stdout"]:
-        logs.append(install_result["stdout"])
-    if install_result["stderr"]:
-        logs.append(install_result["stderr"])
-    if not install_result["ok"]:
-        errors.append("npm install failed")
-        logs.append("npm install failed. Falling back to sandbox HTML shell.")
-        if preserve_last_good and last_good_dir.exists() and (last_good_dir / "index.html").exists():
-            runtime_mode = "recovered-last-good-build"
-            build_dir = str(last_good_dir)
-            logs.append("Recovered the previous successful static build for this sandbox session.")
-        return {"runtime_mode": runtime_mode, "build_dir": build_dir, "logs": logs, "errors": errors}
-
-    build_result = _run_command([npm_path, "run", "build"], frontend_root, timeout_seconds=240)
-    logs.append(f"$ {build_result['command']}")
-    if build_result["stdout"]:
-        logs.append(build_result["stdout"])
-    if build_result["stderr"]:
-        logs.append(build_result["stderr"])
-    if not build_result["ok"]:
-        errors.append("npm run build failed")
-        logs.append("Build failed. Falling back to sandbox HTML shell.")
-        if preserve_last_good and last_good_dir.exists() and (last_good_dir / "index.html").exists():
-            runtime_mode = "recovered-last-good-build"
-            build_dir = str(last_good_dir)
-            logs.append("Recovered the previous successful static build for this sandbox session.")
-        return {"runtime_mode": runtime_mode, "build_dir": build_dir, "logs": logs, "errors": errors}
-
-    dist_dir = frontend_root / "dist"
-    if (dist_dir / "index.html").exists():
-        runtime_mode = "built-static-preview"
-        build_dir = str(dist_dir)
-        if last_good_dir.exists():
-            shutil.rmtree(last_good_dir, ignore_errors=True)
-        shutil.copytree(dist_dir, last_good_dir)
-        logs.append("Static frontend build generated successfully. Serving sandbox dist bundle.")
-        logs.append("Saved this build as the last known good sandbox snapshot.")
-    else:
-        logs.append("Build completed but dist/index.html was not found. Falling back to sandbox HTML shell.")
-    return {"runtime_mode": runtime_mode, "build_dir": build_dir, "logs": logs, "errors": errors}
-
-def _save_preview_artifacts(session_id: str, manifest: Dict[str, Any], logs: List[str], errors: List[str]) -> None:
-    session_dir = _session_dir(session_id)
-    (session_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    (session_dir / "logs.json").write_text(json.dumps({"logs": logs, "errors": errors}, indent=2), encoding="utf-8")
-
-def _session_payload(session_id: str, session: Dict[str, Any]) -> Dict[str, Any]:
-    errors = session.get("errors", [])
-    logs = session.get("logs", [])
-    return {
-        "ok": True,
-        "session_id": session_id,
-        "status": session.get("status", "ready"),
-        "route": session.get("route", "/"),
-        "auth_mode": session.get("auth_mode", "guest"),
-        "file_count": session.get("file_count", 0),
-        "preview_url": f"/preview/session/{session_id}",
-        "manifest_url": f"/preview/manifest/{session_id}",
-        "files_url": f"/preview/files/{session_id}",
-        "logs_url": f"/preview/logs/{session_id}",
-        "project_dir": session.get("project_dir", ""),
-        "build_dir": session.get("build_dir", ""),
-        "updated_at": session.get("updated_at"),
-        "runtime_mode": session.get("runtime_mode", "prepared"),
-        "logs": session.get("logs", []),
-        "errors": errors,
-        "recovery_hint": session.get("recovery_hint") or _error_hint(errors, logs),
-        "recoverable": session.get("status") in {"fallback", "error", "degraded"},
-    }
-
-@app.post("/preview/run")
-def preview_run(payload: PreviewRunRequest):
-    _cleanup_preview_sessions()
-    session_id = _safe_session_id(payload.session_id)
-    write_result = _write_preview_project(session_id, payload.files)
-    runtime_result = _execute_preview_runtime(session_id, payload, write_result)
-    manifest = _build_preview_manifest(payload, session_id, write_result, runtime_result["runtime_mode"], runtime_result["build_dir"])
-    _save_preview_artifacts(session_id, manifest, runtime_result["logs"], runtime_result["errors"])
-    html = _build_preview_html(payload, session_id)
-    _PREVIEW_SESSIONS[session_id] = {
-        "session_id": session_id,
-        "project_id": payload.project_id,
-        "status": "ready" if runtime_result["runtime_mode"] == "built-static-preview" else ("degraded" if runtime_result["runtime_mode"] == "recovered-last-good-build" else "fallback"),
-        "route": payload.route or "/",
-        "auth_mode": payload.auth_mode or "guest",
-        "file_count": len(payload.files),
-        "updated_at": int(time.time()),
-        "preview_html": html,
-        "project_dir": write_result["project_dir"],
-        "build_dir": runtime_result["build_dir"],
-        "runtime_mode": runtime_result["runtime_mode"],
-        "manifest": manifest,
-        "logs": runtime_result["logs"],
-        "errors": runtime_result["errors"],
-        "recovery_hint": _error_hint(runtime_result["errors"], runtime_result["logs"]),
-    }
-    return _session_payload(session_id, _PREVIEW_SESSIONS[session_id])
-
-@app.post("/preview/reload/{session_id}")
-def preview_reload(session_id: str, payload: PreviewRunRequest):
-    payload.session_id = session_id
-    return preview_run(payload)
-
-@app.get("/preview/status/{session_id}")
-def preview_status(session_id: str):
-    session = _PREVIEW_SESSIONS.get(session_id)
-    if not session:
-        return {"ok": False, "status": "missing", "session_id": session_id}
-    return _session_payload(session_id, session)
-
-@app.get("/preview/manifest/{session_id}")
-def preview_manifest(session_id: str):
-    session = _PREVIEW_SESSIONS.get(session_id)
-    if not session:
-        return {"ok": False, "status": "missing", "session_id": session_id}
-    return {"ok": True, "session_id": session_id, "manifest": session.get("manifest", {})}
-
-@app.get("/preview/files/{session_id}")
-def preview_files(session_id: str):
-    session = _PREVIEW_SESSIONS.get(session_id)
-    if not session:
-        return {"ok": False, "status": "missing", "session_id": session_id}
-    return {"ok": True, "session_id": session_id, "project_dir": session.get("project_dir", ""), "files": session.get("manifest", {}).get("files", [])}
-
-@app.get("/preview/logs/{session_id}")
-def preview_logs(session_id: str):
-    session = _PREVIEW_SESSIONS.get(session_id)
-    if not session:
-        return {"ok": False, "status": "missing", "session_id": session_id}
-    return {
-        "ok": True,
-        "session_id": session_id,
-        "logs": session.get("logs", []),
-        "errors": session.get("errors", []),
-        "recovery_hint": session.get("recovery_hint") or _error_hint(session.get("errors", []), session.get("logs", [])),
-    }
-
-@app.post("/preview/recover/{session_id}")
-def preview_recover(session_id: str):
-    session = _PREVIEW_SESSIONS.get(session_id)
-    if not session:
-        return {"ok": False, "status": "missing", "session_id": session_id}
-
-    manifest_path = _session_dir(session_id) / "manifest.json"
-    manifest = _read_json_file(manifest_path, session.get("manifest", {}))
-    files = []
-    for item in manifest.get("files", []):
-        rel_path = item.get("path")
-        if not rel_path:
-            continue
-        source = Path(session.get("project_dir", "")) / rel_path
-        try:
-            content = source.read_text(encoding="utf-8")
-        except Exception:
-            content = ""
-        files.append({
-            "path": rel_path,
-            "content": content,
-            "language": item.get("language") or "",
-        })
-
-    payload = PreviewRunRequest(
-        session_id=session_id,
-        project_id=session.get("project_id") or manifest.get("project_id"),
-        prompt=manifest.get("prompt") or "Recovered runtime sandbox",
-        app_type=manifest.get("app_type") or "",
-        builder_mode=manifest.get("builder_mode") or "",
-        route=session.get("route") or manifest.get("route") or "/",
-        auth_mode=session.get("auth_mode") or manifest.get("auth_mode") or "guest",
-        files=files,
-        routes=manifest.get("routes") or [],
-        components=manifest.get("components") or [],
-        systems=manifest.get("systems") or [],
-    )
-    return preview_run(payload)
-
-@app.post("/preview/reset")
-def preview_reset(payload: PreviewResetRequest):
-    removed = _PREVIEW_SESSIONS.pop(payload.session_id, None)
-    if removed:
-        shutil.rmtree(_preview_root() / payload.session_id, ignore_errors=True)
-    return {"ok": True, "removed": bool(removed), "session_id": payload.session_id}
-
-@app.get("/preview/session/{session_id}", response_class=HTMLResponse)
-@app.get("/preview/session/{session_id}/{asset_path:path}")
-def preview_session(session_id: str, asset_path: str = ""):
-    session = _PREVIEW_SESSIONS.get(session_id)
-    if not session:
-        return HTMLResponse("<h1>Sandbox session not found</h1>", status_code=404)
-
-    build_dir = session.get("build_dir")
-    if build_dir:
-        root = Path(build_dir)
-        requested = (root / asset_path) if asset_path else (root / "index.html")
-        if requested.exists() and requested.is_file():
-            return FileResponse(requested)
-
-    if asset_path:
-        return JSONResponse({"ok": False, "status": "missing-asset", "session_id": session_id, "asset_path": asset_path}, status_code=404)
-    return HTMLResponse(session.get("preview_html", "<h1>Empty sandbox session</h1>"))
