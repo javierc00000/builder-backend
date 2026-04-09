@@ -1,938 +1,885 @@
+from __future__ import annotations
+
+import io
+import json
+import os
+import re
+import textwrap
+import zipfile
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any
-import re
 
 
-app = FastAPI(title="Builder Backend v3 - Code Generator")
+# -----------------------------------------------------------------------------
+# Models
+# -----------------------------------------------------------------------------
 
+class MutateRequest(BaseModel):
+    instruction: str = Field(..., min_length=1)
+    files: List[Dict[str, Any]] = Field(default_factory=list)
+    systems: List[str] = Field(default_factory=list)
+    complexity: str = "mvp"
+    architecture: Dict[str, Any] = Field(default_factory=dict)
+    app_name: Optional[str] = None
+
+
+class GenerateCodeRequest(BaseModel):
+    idea: str = Field(..., min_length=1)
+    systems: List[str] = Field(default_factory=list)
+    complexity: str = "mvp"
+    architecture: Dict[str, Any] = Field(default_factory=dict)
+    app_name: Optional[str] = None
+    existing_files: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+@dataclass
+class GeneratedFile:
+    path: str
+    content: str
+    kind: str = "code"
+    system: str = "core"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "path": self.path,
+            "content": self.content,
+            "kind": self.kind,
+            "system": self.system,
+        }
+
+
+@dataclass
+class BuildContext:
+    idea: str
+    app_name: str
+    slug: str
+    systems: List[str]
+    complexity: str
+    architecture: Dict[str, Any]
+    frontend: str = "react-vite"
+    backend: str = "fastapi"
+    storage: str = "local"
+    auth: str = "none"
+    billing: str = "none"
+    ai_mode: str = "mock"
+    notes: List[str] = field(default_factory=list)
+
+
+# -----------------------------------------------------------------------------
+# App setup
+# -----------------------------------------------------------------------------
+
+app = FastAPI(title="Builder Backend", version="2.0-system-aware")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "https://builder-frontend.javierc00000.workers.dev",
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-@app.get("/")
-def home():
-    return {"status": "ok", "service": "builder-backend-v3"}
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+
+def slugify(value: str) -> str:
+    value = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
+    return value or "builder-app"
 
 
-@app.get("/health")
-def health():
-    return {"status": "healthy", "service": "builder-backend-v3"}
+def title_from_idea(idea: str) -> str:
+    cleaned = re.sub(r"\s+", " ", idea).strip()
+    cleaned = re.sub(r"^[^a-zA-Z0-9]+", "", cleaned)
+    if not cleaned:
+        return "Builder App"
+    words = cleaned.split(" ")[:4]
+    return " ".join(w.capitalize() for w in words)
 
 
-class ApplianceItem(BaseModel):
-    name: str = ""
-    watts: float = 0
-    hours: float = 0
+def normalize_systems(idea: str, systems: List[str]) -> List[str]:
+    normalized = {s.strip().lower() for s in systems if s and s.strip()}
+    idea_l = idea.lower()
 
-
-class BatteryPlanRequest(BaseModel):
-    appliances: List[ApplianceItem] = Field(default_factory=list)
-    battery_voltage: float = 12
-    autonomy_days: float = 1
-    sun_hours: float = 4
-    system_loss: float = 0.2
-
-
-@app.post("/battery-plan")
-def battery_plan(payload: BatteryPlanRequest):
-    daily_wh = sum(max(item.watts, 0) * max(item.hours, 0) for item in payload.appliances)
-    adjusted_daily_wh = daily_wh * (1 + max(payload.system_loss, 0))
-    battery_ah = round((adjusted_daily_wh * max(payload.autonomy_days, 1)) / max(payload.battery_voltage, 1), 1)
-    solar_watts = round(adjusted_daily_wh / max(payload.sun_hours, 1), 1)
-
-    return {
-        "daily_wh": round(daily_wh, 1),
-        "adjusted_daily_wh": round(adjusted_daily_wh, 1),
-        "battery_ah": battery_ah,
-        "solar_watts": solar_watts,
-        "summary": f"For this setup, plan for about {battery_ah}Ah of battery and {solar_watts}W of solar."
+    keywords = {
+        "auth": ["auth", "login", "register", "sign in", "account", "user"],
+        "dashboard": ["dashboard", "overview", "analytics", "status", "panel"],
+        "storage": ["save", "history", "database", "records", "stored", "inventory"],
+        "settings": ["settings", "profile", "preferences", "account settings"],
+        "billing": ["billing", "subscription", "paywall", "stripe", "payment", "pro"],
+        "ai-tools": ["ai", "assistant", "chat", "scan", "diagnostic", "generate", "analyze"],
+        "admin": ["admin", "portal", "staff", "dealer", "technician", "moderation"],
+        "tools": ["tool", "calculator", "converter", "planner", "estimator"],
     }
 
+    for system, words in keywords.items():
+        if any(word in idea_l for word in words):
+            normalized.add(system)
 
-class MutateRequest(BaseModel):
-    prompt: str
-    current_layout: Dict[str, Any] = Field(default_factory=dict)
-    active_modules: List[str] = Field(default_factory=list)
-    feature_state: Dict[str, Any] = Field(default_factory=dict)
+    normalized.add("dashboard")
+    normalized.add("settings")
 
+    if "ai-tools" in normalized or "tools" in normalized:
+        normalized.add("storage")
 
-class GenerateCodeRequest(BaseModel):
-    prompt: str
-    app_type: str = ""
-    builder_mode: str = ""
-    style: str = "dark glass"
-    routes: List[Dict[str, Any]] = Field(default_factory=list)
-    components: List[Dict[str, Any]] = Field(default_factory=list)
-
-
-def infer_app_type(prompt: str) -> str:
-    p = prompt.lower()
-    if re.search(r"(admin|dashboard|crm|analytics|panel|saas)", p):
-        return "admin panel"
-    if re.search(r"(assistant|chat|copilot|agent|support bot)", p):
-        return "assistant app"
-    if re.search(r"(content|editor|blog|cms|writer|studio)", p):
-        return "content app"
-    return "tool app"
+    ordered = [
+        "auth",
+        "dashboard",
+        "storage",
+        "settings",
+        "billing",
+        "ai-tools",
+        "tools",
+        "admin",
+    ]
+    return [s for s in ordered if s in normalized]
 
 
-def infer_builder_mode(prompt: str) -> str:
-    p = prompt.lower()
-    if re.search(r"(battery|solar|power|inverter|camping)", p):
-        return "battery-planner"
-    if re.search(r"(dashboard|crm|analytics|saas)", p):
-        return "dashboard-builder"
-    if re.search(r"(landing|marketing|website)", p):
-        return "site-builder"
-    if re.search(r"(content|editor|blog|cms)", p):
-        return "content-builder"
-    return "general-builder"
+def infer_context(req: GenerateCodeRequest) -> BuildContext:
+    app_name = (req.app_name or title_from_idea(req.idea)).strip()
+    systems = normalize_systems(req.idea, req.systems)
+    architecture = req.architecture or {}
+
+    ctx = BuildContext(
+        idea=req.idea,
+        app_name=app_name,
+        slug=slugify(app_name),
+        systems=systems,
+        complexity=(req.complexity or "mvp").lower(),
+        architecture=architecture,
+    )
+
+    ctx.frontend = architecture.get("frontend") or "react-vite"
+    ctx.backend = architecture.get("backend") or "fastapi"
+    ctx.storage = architecture.get("storage") or ("sqlite" if "storage" in systems else "local")
+    ctx.auth = architecture.get("auth") or ("demo" if "auth" in systems else "none")
+    ctx.billing = architecture.get("billing") or ("stripe-mock" if "billing" in systems else "none")
+    ctx.ai_mode = architecture.get("aiMode") or ("mock" if "ai-tools" in systems else "none")
+
+    if ctx.complexity == "product":
+        ctx.notes.append("Product mode enabled: generates deeper structure and placeholders for real integrations.")
+    elif ctx.complexity == "starter":
+        ctx.notes.append("Starter mode enabled: keeps files small and easier to edit.")
+    else:
+        ctx.notes.append("MVP mode enabled: balanced structure and speed.")
+
+    return ctx
 
 
-def infer_summary_style(prompt: str) -> str:
-    p = prompt.lower()
-    if re.search(r"(detail|deeper|full|complete|advanced)", p):
-        return "detailed"
-    if re.search(r"(simple|quick|fast|short)", p):
-        return "concise"
-    return "balanced"
+def safe_json(data: Any) -> str:
+    return json.dumps(data, indent=2, ensure_ascii=False)
 
 
-def recommend_modules(prompt: str, app_type: str) -> List[str]:
-    p = prompt.lower()
-    modules = {
-        "results_summary",
-        "save_results",
-        "status_panel",
-        "active_features_panel",
-        "quick_actions",
-        "live_preview",
+def create_zip_bytes(files: List[GeneratedFile]) -> bytes:
+    memory = io.BytesIO()
+    with zipfile.ZipFile(memory, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for item in files:
+            zf.writestr(item.path, item.content)
+    return memory.getvalue()
+
+
+def build_readme(ctx: BuildContext) -> str:
+    systems = ", ".join(ctx.systems) if ctx.systems else "core"
+    return textwrap.dedent(
+        f"""
+        # {ctx.app_name}
+
+        Generated by the AI Builder system-aware backend.
+
+        ## App summary
+        - Idea: {ctx.idea}
+        - Complexity: {ctx.complexity}
+        - Systems: {systems}
+        - Frontend: {ctx.frontend}
+        - Backend: {ctx.backend}
+        - Storage: {ctx.storage}
+        - Auth: {ctx.auth}
+        - Billing: {ctx.billing}
+
+        ## Run frontend
+        ```bash
+        cd frontend
+        npm install
+        npm run dev
+        ```
+
+        ## Run backend
+        ```bash
+        cd backend
+        pip install -r requirements.txt
+        uvicorn main:app --reload
+        ```
+
+        ## Notes
+        {chr(10).join(f"- {n}" for n in ctx.notes)}
+        """
+    ).strip() + "\n"
+
+
+def build_frontend_package_json(ctx: BuildContext) -> str:
+    deps = {
+        "react": "^18.3.1",
+        "react-dom": "^18.3.1",
+        "react-router-dom": "^6.30.1",
     }
-    if app_type == "admin panel":
-        modules.update({"dashboard_shell", "sidebar_navigation", "split_workspace"})
-    if app_type == "assistant app":
-        modules.update({"split_workspace", "notes_panel"})
-    if app_type == "content app":
-        modules.update({"notes_panel", "split_workspace"})
-    if app_type == "tool app":
-        modules.update({"split_workspace"})
-    if re.search(r"(battery|solar|power|calculator|tool)", p):
-        modules.add("calculator_engine")
-    if re.search(r"(affiliate|amazon|monetize|shop)", p):
-        modules.add("affiliate_suggestions")
-    if re.search(r"(export|report|download|pdf)", p):
-        modules.add("export_report")
-    if re.search(r"(sidebar|navigation|rail)", p):
-        modules.add("sidebar_navigation")
-    if re.search(r"(notes|brainstorm|scratch)", p):
-        modules.add("notes_panel")
-    if re.search(r"(dashboard|crm|saas)", p):
-        modules.add("dashboard_shell")
-    if re.search(r"(split|two column|2 column|2-column)", p):
-        modules.add("split_workspace")
-    return sorted(modules)
+    dev_deps = {
+        "vite": "^5.4.19",
+        "@vitejs/plugin-react": "^4.7.0",
+    }
+    return safe_json(
+        {
+            "name": ctx.slug,
+            "private": True,
+            "version": "0.1.0",
+            "type": "module",
+            "scripts": {
+                "dev": "vite",
+                "build": "vite build",
+                "preview": "vite preview",
+            },
+            "dependencies": deps,
+            "devDependencies": dev_deps,
+        }
+    ) + "\n"
 
 
-def build_layout(prompt: str, current_layout: Dict[str, Any]) -> Dict[str, Any]:
-    layout = {
-        "mode": current_layout.get("mode", "workspace"),
-        "shell": current_layout.get("shell", "classic"),
-        "sidebar": current_layout.get("sidebar", False),
-        "split": current_layout.get("split", False),
-        "topbar": current_layout.get("topbar", True),
-        "inspector": current_layout.get("inspector", False),
-        "cards": current_layout.get("cards", True),
-        "dense": current_layout.get("dense", False),
-        "previewStyle": current_layout.get("previewStyle", "wireframe"),
-        "panels": {
-            "sidebar": list(current_layout.get("panels", {}).get("sidebar", ["builder", "results", "modules", "mutations"])),
-            "mainTop": list(current_layout.get("panels", {}).get("mainTop", ["brain", "command", "quickActions"])),
-            "mainBottom": list(current_layout.get("panels", {}).get("mainBottom", ["planner", "results", "preview"])),
-            "inspector": list(current_layout.get("panels", {}).get("inspector", ["status", "affiliate", "notes"])),
+def build_frontend_vite_config() -> str:
+    return textwrap.dedent(
+        """
+        import { defineConfig } from 'vite'
+        import react from '@vitejs/plugin-react'
+
+        export default defineConfig({
+          plugins: [react()],
+          server: {
+            port: 5173,
+          },
+        })
+        """
+    ).strip() + "\n"
+
+
+def build_frontend_index_html(ctx: BuildContext) -> str:
+    return textwrap.dedent(
+        f"""
+        <!doctype html>
+        <html lang="en">
+          <head>
+            <meta charset="UTF-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+            <title>{ctx.app_name}</title>
+          </head>
+          <body>
+            <div id="root"></div>
+            <script type="module" src="/src/main.jsx"></script>
+          </body>
+        </html>
+        """
+    ).strip() + "\n"
+
+
+def build_frontend_main() -> str:
+    return textwrap.dedent(
+        """
+        import React from 'react'
+        import ReactDOM from 'react-dom/client'
+        import { BrowserRouter } from 'react-router-dom'
+        import App from './App'
+        import './styles.css'
+
+        ReactDOM.createRoot(document.getElementById('root')).render(
+          <React.StrictMode>
+            <BrowserRouter>
+              <App />
+            </BrowserRouter>
+          </React.StrictMode>
+        )
+        """
+    ).strip() + "\n"
+
+
+def build_frontend_styles() -> str:
+    return textwrap.dedent(
+        """
+        :root {
+          font-family: Inter, system-ui, sans-serif;
+          color: #e5e7eb;
+          background: #0b1020;
+        }
+
+        * { box-sizing: border-box; }
+        body { margin: 0; background: linear-gradient(180deg, #0b1020, #111827); }
+        a { color: inherit; text-decoration: none; }
+        button { cursor: pointer; }
+
+        .app-shell {
+          max-width: 1240px;
+          margin: 0 auto;
+          padding: 24px;
+        }
+
+        .hero, .panel, .card, .route-card {
+          border: 1px solid rgba(255,255,255,0.08);
+          background: rgba(255,255,255,0.04);
+          border-radius: 20px;
+          box-shadow: 0 10px 30px rgba(0,0,0,0.18);
+        }
+
+        .hero { padding: 24px; display: grid; gap: 16px; }
+        .panel { padding: 18px; }
+        .grid { display: grid; gap: 16px; }
+        .grid-3 { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+        .grid-2 { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+        .nav { display: flex; flex-wrap: wrap; gap: 10px; margin: 18px 0; }
+        .chip {
+          padding: 8px 12px;
+          border-radius: 999px;
+          border: 1px solid rgba(255,255,255,0.1);
+          background: rgba(255,255,255,0.06);
+          font-size: 14px;
+        }
+        .cta {
+          padding: 12px 16px;
+          border-radius: 14px;
+          border: none;
+          background: #2563eb;
+          color: white;
+          font-weight: 700;
+        }
+        .section-title { font-size: 20px; font-weight: 700; margin: 0 0 12px; }
+        .muted { opacity: 0.78; }
+        .list { display: grid; gap: 10px; padding-left: 18px; }
+        .topbar {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          gap: 14px;
+          margin-bottom: 20px;
+        }
+        .route-list { display: grid; gap: 12px; }
+        .route-card { padding: 16px; }
+        .mini { font-size: 12px; opacity: 0.7; }
+        .stack { display: flex; flex-wrap: wrap; gap: 8px; }
+        @media (max-width: 720px) {
+          .app-shell { padding: 14px; }
+        }
+        """
+    ).strip() + "\n"
+
+
+def build_system_registry(ctx: BuildContext) -> str:
+    definitions = {
+        "auth": {
+            "title": "Authentication",
+            "summary": "Login, register, session state, and protected routes.",
+        },
+        "dashboard": {
+            "title": "Dashboard",
+            "summary": "Overview, recent activity, quick actions, and stats.",
+        },
+        "storage": {
+            "title": "Storage",
+            "summary": "Saved items, history, persistence layer, and API data access.",
+        },
+        "settings": {
+            "title": "Settings",
+            "summary": "Profile, preferences, environment, and app behavior controls.",
+        },
+        "billing": {
+            "title": "Billing",
+            "summary": "Plans, entitlement gates, upgrade prompts, and subscription placeholders.",
+        },
+        "ai-tools": {
+            "title": "AI Tools",
+            "summary": "Prompt-powered tools, scans, analysis, or generation workflows.",
+        },
+        "tools": {
+            "title": "Tools",
+            "summary": "Calculators, planners, utilities, and guided workflows.",
+        },
+        "admin": {
+            "title": "Admin",
+            "summary": "Portal pages, moderation, staff access, and system visibility.",
         },
     }
-    p = prompt.lower()
-    if re.search(r"(dashboard|crm|saas)", p):
-        layout["mode"] = "dashboard"
-        layout["shell"] = "dashboard"
-        layout["sidebar"] = True
-        layout["split"] = True
-        layout["inspector"] = True
-        layout["previewStyle"] = "dashboard"
-    if re.search(r"(assistant|copilot|agent)", p):
-        layout["mode"] = "workspace"
-        layout["shell"] = "classic"
-        layout["split"] = True
-        layout["inspector"] = True
-    if re.search(r"(content|editor|writer|studio)", p):
-        layout["mode"] = "workspace"
-        layout["shell"] = "classic"
-        layout["split"] = True
-        layout["inspector"] = True
-    if re.search(r"(focus preview|preview first|canvas focus)", p):
-        layout["mode"] = "focus"
-        layout["shell"] = "focus"
-        layout["split"] = True
-        layout["previewStyle"] = "spotlight"
-    if re.search(r"(dense|compact)", p):
-        layout["dense"] = True
-    if re.search(r"(spacious|comfortable|relaxed)", p):
-        layout["dense"] = False
-    if re.search(r"(add sidebar|sidebar|navigation)", p):
-        layout["sidebar"] = True
-    if re.search(r"(add inspector|inspector|right panel)", p):
-        layout["inspector"] = True
-    if re.search(r"(split|two column|2 column|2-column)", p):
-        layout["split"] = True
-    return layout
+    active = {key: definitions[key] for key in ctx.systems if key in definitions}
+    return "export const systemRegistry = " + safe_json(active) + "\n"
 
 
-def build_file_tree(app_type: str, builder_mode: str, prompt: str) -> List[Dict[str, Any]]:
-    base = [
-        {"path": "src/App.jsx", "kind": "file", "role": "root app"},
-        {"path": "src/main.jsx", "kind": "file", "role": "entry"},
-        {"path": "src/styles/app.css", "kind": "file", "role": "global styles"},
-        {"path": "src/components", "kind": "folder", "role": "ui components"},
-        {"path": "src/pages", "kind": "folder", "role": "pages"},
-        {"path": "src/lib", "kind": "folder", "role": "helpers"},
+def build_routes_file(ctx: BuildContext) -> str:
+    routes: List[Dict[str, str]] = [
+        {"path": "/", "label": "Home", "system": "core"},
     ]
-    if app_type == "admin panel":
-        base += [
-            {"path": "src/pages/DashboardPage.jsx", "kind": "file", "role": "dashboard page"},
-            {"path": "src/components/Sidebar.jsx", "kind": "file", "role": "navigation"},
-            {"path": "src/components/KpiCard.jsx", "kind": "file", "role": "metrics card"},
-            {"path": "src/components/InspectorPanel.jsx", "kind": "file", "role": "details panel"},
-        ]
-    elif app_type == "assistant app":
-        base += [
-            {"path": "src/pages/AssistantPage.jsx", "kind": "file", "role": "assistant page"},
-            {"path": "src/components/ChatShell.jsx", "kind": "file", "role": "chat interface"},
-            {"path": "src/components/ToolRail.jsx", "kind": "file", "role": "tools rail"},
-            {"path": "src/components/MemoryPanel.jsx", "kind": "file", "role": "memory / notes"},
-        ]
-    elif app_type == "content app":
-        base += [
-            {"path": "src/pages/StudioPage.jsx", "kind": "file", "role": "content studio"},
-            {"path": "src/components/EditorShell.jsx", "kind": "file", "role": "editor"},
-            {"path": "src/components/PreviewPanel.jsx", "kind": "file", "role": "content preview"},
-            {"path": "src/components/NotesPanel.jsx", "kind": "file", "role": "notes"},
-        ]
-    else:
-        base += [
-            {"path": "src/pages/ToolPage.jsx", "kind": "file", "role": "tool page"},
-            {"path": "src/components/CalculatorForm.jsx", "kind": "file", "role": "tool input"},
-            {"path": "src/components/ResultsPanel.jsx", "kind": "file", "role": "tool output"},
-            {"path": "src/components/ExportActions.jsx", "kind": "file", "role": "export controls"},
-        ]
-    if builder_mode == "battery-planner":
-        base += [
-            {"path": "src/lib/batteryMath.js", "kind": "file", "role": "calculation logic"},
-            {"path": "src/components/ApplianceTable.jsx", "kind": "file", "role": "appliance rows"},
-        ]
-    if re.search(r"(auth|login|signin|sign in)", prompt.lower()):
-        base += [
-            {"path": "src/pages/LoginPage.jsx", "kind": "file", "role": "authentication"},
-            {"path": "src/lib/auth.js", "kind": "file", "role": "auth helpers"},
-        ]
-    return base
-
-
-def build_routes(app_type: str, prompt: str) -> List[Dict[str, str]]:
-    routes = [{"path": "/", "component": "App", "reason": "root route"}]
-    if app_type == "admin panel":
-        routes += [
-            {"path": "/dashboard", "component": "DashboardPage", "reason": "main admin workspace"},
-            {"path": "/settings", "component": "SettingsPage", "reason": "workspace settings"},
-        ]
-    elif app_type == "assistant app":
-        routes += [
-            {"path": "/assistant", "component": "AssistantPage", "reason": "assistant shell"},
-            {"path": "/history", "component": "HistoryPage", "reason": "saved conversations"},
-        ]
-    elif app_type == "content app":
-        routes += [
-            {"path": "/studio", "component": "StudioPage", "reason": "content workspace"},
-            {"path": "/preview", "component": "PreviewPage", "reason": "content preview"},
-        ]
-    else:
-        routes += [
-            {"path": "/tool", "component": "ToolPage", "reason": "primary tool surface"},
-            {"path": "/results", "component": "ResultsPage", "reason": "output view"},
-        ]
-    if re.search(r"(auth|login|signin|sign in)", prompt.lower()):
-        routes.append({"path": "/login", "component": "LoginPage", "reason": "auth entry"})
-    return routes
-
-
-def build_components(app_type: str, prompt: str) -> List[Dict[str, str]]:
-    base = [
-        {"name": "CommandBar", "purpose": "captures builder commands"},
-        {"name": "LivePreview", "purpose": "renders structural preview"},
-        {"name": "StatusBadge", "purpose": "shows api and workspace status"},
-    ]
-    if app_type == "admin panel":
-        base += [
-            {"name": "Sidebar", "purpose": "left navigation"},
-            {"name": "KpiCard", "purpose": "metric summaries"},
-            {"name": "InspectorPanel", "purpose": "details and controls"},
-        ]
-    elif app_type == "assistant app":
-        base += [
-            {"name": "ChatShell", "purpose": "conversation interface"},
-            {"name": "ToolRail", "purpose": "assistant tools"},
-            {"name": "MemoryPanel", "purpose": "session memory"},
-        ]
-    elif app_type == "content app":
-        base += [
-            {"name": "EditorShell", "purpose": "writing interface"},
-            {"name": "PreviewPanel", "purpose": "live content preview"},
-            {"name": "NotesPanel", "purpose": "draft notes"},
-        ]
-    else:
-        base += [
-            {"name": "CalculatorForm", "purpose": "tool inputs"},
-            {"name": "ResultsPanel", "purpose": "tool outputs"},
-            {"name": "ExportActions", "purpose": "download/export actions"},
-        ]
-    return base
-
-
-def build_mutation_summary(layout: Dict[str, Any], modules: List[str], app_type: str, builder_mode: str) -> List[str]:
-    summary = [
-        f"App type detected: {app_type}",
-        f"Builder mode detected: {builder_mode}",
-        f"Layout shell: {layout['shell']}",
-        f"Preview style: {layout['previewStyle']}",
-        f"Active modules planned: {len(modules)}",
-    ]
-    if layout.get("sidebar"):
-        summary.append("Sidebar enabled")
-    if layout.get("split"):
-        summary.append("Split workspace enabled")
-    if layout.get("inspector"):
-        summary.append("Inspector enabled")
-    return summary
-
-
-def app_css(style_name: str) -> str:
-    return """
-:root {
-  color-scheme: dark;
-  --bg: #07111f;
-  --panel: rgba(13, 25, 43, 0.88);
-  --panel-border: rgba(148, 163, 184, 0.16);
-  --text: #e5eefc;
-  --muted: #93a4bf;
-  --accent: #66d9ef;
-  --accent-2: #8b5cf6;
-}
-
-* { box-sizing: border-box; }
-body {
-  margin: 0;
-  font-family: Inter, system-ui, Arial, sans-serif;
-  background: radial-gradient(circle at top, #12203a, #07111f 55%);
-  color: var(--text);
-}
-button, input { font: inherit; }
-.app-shell {
-  min-height: 100vh;
-  padding: 24px;
-  display: grid;
-  gap: 18px;
-}
-.panel {
-  border: 1px solid var(--panel-border);
-  background: var(--panel);
-  border-radius: 20px;
-  padding: 18px;
-}
-.row {
-  display: grid;
-  gap: 18px;
-}
-.row.two {
-  grid-template-columns: 260px 1fr;
-}
-.row.three {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-}
-.pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  border-radius: 999px;
-  padding: 8px 12px;
-  border: 1px solid rgba(148, 163, 184, 0.18);
-  background: rgba(255,255,255,0.04);
-  color: var(--muted);
-}
-.primary-btn {
-  border: none;
-  border-radius: 999px;
-  padding: 12px 18px;
-  font-weight: 700;
-  cursor: pointer;
-  background: linear-gradient(135deg, var(--accent), var(--accent-2));
-  color: #07111f;
-}
-.muted { color: var(--muted); }
-.card-grid {
-  display: grid;
-  gap: 12px;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-}
-.card {
-  border: 1px solid rgba(148,163,184,.14);
-  border-radius: 16px;
-  padding: 16px;
-  background: rgba(255,255,255,0.03);
-}
-.input {
-  width: 100%;
-  border-radius: 14px;
-  border: 1px solid rgba(148,163,184,.16);
-  background: rgba(255,255,255,.04);
-  color: var(--text);
-  padding: 12px 14px;
-}
-@media (max-width: 900px) {
-  .row.two, .row.three {
-    grid-template-columns: 1fr;
-  }
-}
-""".strip()
-
-
-def main_jsx() -> str:
-    return """
-import React from "react";
-import ReactDOM from "react-dom/client";
-import App from "./App.jsx";
-import "./styles/app.css";
-
-ReactDOM.createRoot(document.getElementById("root")).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>
-);
-""".strip()
-
-
-def root_app_code(app_type: str, prompt: str) -> str:
-    page_name = {
-        "admin panel": "DashboardPage",
-        "assistant app": "AssistantPage",
-        "content app": "StudioPage",
-        "tool app": "ToolPage",
-    }.get(app_type, "ToolPage")
-
-    return f"""
-import React from "react";
-import {page_name} from "./pages/{page_name}.jsx";
-
-export default function App() {{
-  return <{page_name} />;
-}}
-""".strip()
-
-
-def dashboard_page_code(prompt: str) -> str:
-    return f"""
-import React from "react";
-import {{ Sidebar }} from "../components/Sidebar.jsx";
-import {{ KpiCard }} from "../components/KpiCard.jsx";
-import {{ InspectorPanel }} from "../components/InspectorPanel.jsx";
-
-export function DashboardPage() {{
-  return (
-    <div className="app-shell">
-      <div className="panel">
-        <div className="pill">Admin dashboard</div>
-        <h1>CRM Dashboard</h1>
-        <p className="muted">{prompt}</p>
-      </div>
-
-      <div className="row two">
-        <Sidebar />
-        <div className="row">
-          <div className="card-grid">
-            <KpiCard title="Revenue" value="$24.5k" />
-            <KpiCard title="Pipeline" value="42 deals" />
-            <KpiCard title="Tickets" value="18 open" />
-          </div>
-          <div className="panel">
-            <h2>Workspace</h2>
-            <p className="muted">This generated dashboard gives you a clean admin shell to continue building from.</p>
-          </div>
-        </div>
-      </div>
-
-      <InspectorPanel />
-    </div>
-  );
-}}
-""".strip()
-
-
-def assistant_page_code(prompt: str) -> str:
-    return f"""
-import React from "react";
-import {{ ChatShell }} from "../components/ChatShell.jsx";
-import {{ ToolRail }} from "../components/ToolRail.jsx";
-import {{ MemoryPanel }} from "../components/MemoryPanel.jsx";
-
-export function AssistantPage() {{
-  return (
-    <div className="app-shell">
-      <div className="panel">
-        <div className="pill">Assistant workspace</div>
-        <h1>AI Assistant</h1>
-        <p className="muted">{prompt}</p>
-      </div>
-
-      <div className="row two">
-        <ToolRail />
-        <ChatShell />
-      </div>
-
-      <MemoryPanel />
-    </div>
-  );
-}}
-""".strip()
-
-
-def studio_page_code(prompt: str) -> str:
-    return f"""
-import React from "react";
-import {{ EditorShell }} from "../components/EditorShell.jsx";
-import {{ PreviewPanel }} from "../components/PreviewPanel.jsx";
-import {{ NotesPanel }} from "../components/NotesPanel.jsx";
-
-export function StudioPage() {{
-  return (
-    <div className="app-shell">
-      <div className="panel">
-        <div className="pill">Content studio</div>
-        <h1>Content App</h1>
-        <p className="muted">{prompt}</p>
-      </div>
-
-      <div className="row two">
-        <EditorShell />
-        <PreviewPanel />
-      </div>
-
-      <NotesPanel />
-    </div>
-  );
-}}
-""".strip()
-
-
-def tool_page_code(prompt: str, battery_mode: bool) -> str:
-    extra = '<p className="muted">Battery-focused starter logic can be added next.</p>' if battery_mode else '<p className="muted">This is a clean generated tool starter.</p>'
-    return f"""
-import React from "react";
-import {{ CalculatorForm }} from "../components/CalculatorForm.jsx";
-import {{ ResultsPanel }} from "../components/ResultsPanel.jsx";
-import {{ ExportActions }} from "../components/ExportActions.jsx";
-
-export function ToolPage() {{
-  return (
-    <div className="app-shell">
-      <div className="panel">
-        <div className="pill">Tool workspace</div>
-        <h1>Tool / Calculator</h1>
-        <p className="muted">{prompt}</p>
-        {extra}
-      </div>
-
-      <div className="row two">
-        <CalculatorForm />
-        <ResultsPanel />
-      </div>
-
-      <ExportActions />
-    </div>
-  );
-}}
-""".strip()
-
-
-def sidebar_code() -> str:
-    return """
-import React from "react";
-
-export function Sidebar() {
-  return (
-    <aside className="panel">
-      <h3>Navigation</h3>
-      <div className="card-grid">
-        <div className="card">Overview</div>
-        <div className="card">Customers</div>
-        <div className="card">Deals</div>
-        <div className="card">Reports</div>
-      </div>
-    </aside>
-  );
-}
-""".strip()
-
-
-def kpi_card_code() -> str:
-    return """
-import React from "react";
-
-export function KpiCard({ title, value }) {
-  return (
-    <div className="card">
-      <div className="pill">{title}</div>
-      <h3>{value}</h3>
-    </div>
-  );
-}
-""".strip()
-
-
-def inspector_code() -> str:
-    return """
-import React from "react";
-
-export function InspectorPanel() {
-  return (
-    <section className="panel">
-      <h3>Inspector</h3>
-      <p className="muted">Use this space for details, selected records, and quick controls.</p>
-    </section>
-  );
-}
-""".strip()
-
-
-def chat_shell_code() -> str:
-    return """
-import React from "react";
-
-export function ChatShell() {
-  return (
-    <section className="panel">
-      <h3>Conversation</h3>
-      <div className="card">Assistant response area</div>
-      <input className="input" placeholder="Ask something..." />
-    </section>
-  );
-}
-""".strip()
-
-
-def tool_rail_code() -> str:
-    return """
-import React from "react";
-
-export function ToolRail() {
-  return (
-    <aside className="panel">
-      <h3>Tools</h3>
-      <div className="card-grid">
-        <div className="card">Search</div>
-        <div className="card">Actions</div>
-        <div className="card">History</div>
-      </div>
-    </aside>
-  );
-}
-""".strip()
-
-
-def memory_panel_code() -> str:
-    return """
-import React from "react";
-
-export function MemoryPanel() {
-  return (
-    <section className="panel">
-      <h3>Memory</h3>
-      <p className="muted">Save notes, pinned answers, and reusable context here.</p>
-    </section>
-  );
-}
-""".strip()
-
-
-def editor_shell_code() -> str:
-    return """
-import React from "react";
-
-export function EditorShell() {
-  return (
-    <section className="panel">
-      <h3>Editor</h3>
-      <textarea className="input" rows={12} defaultValue="Start writing here..." />
-    </section>
-  );
-}
-""".strip()
-
-
-def preview_panel_code() -> str:
-    return """
-import React from "react";
-
-export function PreviewPanel() {
-  return (
-    <section className="panel">
-      <h3>Preview</h3>
-      <div className="card">Live preview area</div>
-    </section>
-  );
-}
-""".strip()
-
-
-def notes_panel_code() -> str:
-    return """
-import React from "react";
-
-export function NotesPanel() {
-  return (
-    <section className="panel">
-      <h3>Notes</h3>
-      <textarea className="input" rows={6} defaultValue="Draft notes..." />
-    </section>
-  );
-}
-""".strip()
-
-
-def calculator_form_code() -> str:
-    return """
-import React from "react";
-
-export function CalculatorForm() {
-  return (
-    <section className="panel">
-      <h3>Inputs</h3>
-      <div className="row">
-        <input className="input" placeholder="Value 1" />
-        <input className="input" placeholder="Value 2" />
-        <button className="primary-btn">Calculate</button>
-      </div>
-    </section>
-  );
-}
-""".strip()
-
-
-def results_panel_code() -> str:
-    return """
-import React from "react";
-
-export function ResultsPanel() {
-  return (
-    <section className="panel">
-      <h3>Results</h3>
-      <div className="card">Calculated output will appear here.</div>
-    </section>
-  );
-}
-""".strip()
-
-
-def export_actions_code() -> str:
-    return """
-import React from "react";
-
-export function ExportActions() {
-  return (
-    <section className="panel">
-      <h3>Export</h3>
-      <div className="row">
-        <button className="primary-btn">Export JSON</button>
-        <button className="primary-btn">Export PDF</button>
-      </div>
-    </section>
-  );
-}
-""".strip()
-
-
-def login_page_code() -> str:
-    return """
-import React from "react";
-
-export function LoginPage() {
-  return (
-    <div className="app-shell">
-      <section className="panel">
-        <h1>Login</h1>
-        <div className="row">
-          <input className="input" placeholder="Email" />
-          <input className="input" placeholder="Password" type="password" />
-          <button className="primary-btn">Sign in</button>
-        </div>
-      </section>
-    </div>
-  );
-}
-""".strip()
-
-
-def auth_code() -> str:
-    return """
-export function signIn(email, password) {
-  return { ok: true, email, token: "demo-token" };
-}
-""".strip()
-
-
-def battery_math_code() -> str:
-    return """
-export function estimateBatteryPlan(items = [], voltage = 12, autonomyDays = 1, sunHours = 4, systemLoss = 0.2) {
-  const dailyWh = items.reduce((sum, item) => sum + ((item.watts || 0) * (item.hours || 0)), 0);
-  const adjustedDailyWh = dailyWh * (1 + systemLoss);
-  const batteryAh = Number(((adjustedDailyWh * autonomyDays) / Math.max(voltage, 1)).toFixed(1));
-  const solarWatts = Number((adjustedDailyWh / Math.max(sunHours, 1)).toFixed(1));
-  return { dailyWh, adjustedDailyWh, batteryAh, solarWatts };
-}
-""".strip()
-
-
-def appliance_table_code() -> str:
-    return """
-import React from "react";
-
-export function ApplianceTable() {
-  return (
-    <section className="panel">
-      <h3>Appliances</h3>
-      <div className="card">RV Fridge · Lights · Fan</div>
-    </section>
-  );
-}
-""".strip()
-
-
-def generate_code_bundle(prompt: str, app_type: str, builder_mode: str, style: str) -> List[Dict[str, Any]]:
-    files = [
-        {"path": "src/main.jsx", "language": "javascript", "content": main_jsx()},
-        {"path": "src/App.jsx", "language": "javascript", "content": root_app_code(app_type, prompt)},
-        {"path": "src/styles/app.css", "language": "css", "content": app_css(style)},
+    mapping = {
+        "dashboard": ("/dashboard", "Dashboard"),
+        "auth": ("/auth", "Auth"),
+        "storage": ("/library", "Library"),
+        "settings": ("/settings", "Settings"),
+        "billing": ("/billing", "Billing"),
+        "ai-tools": ("/ai-tools", "AI Tools"),
+        "tools": ("/tools", "Tools"),
+        "admin": ("/admin", "Admin"),
+    }
+    for system in ctx.systems:
+        if system in mapping:
+            path, label = mapping[system]
+            routes.append({"path": path, "label": label, "system": system})
+
+    return "export const appRoutes = " + safe_json(routes) + "\n"
+
+
+def build_app_component(ctx: BuildContext) -> str:
+    sections = []
+    if "dashboard" in ctx.systems:
+        sections.append(
+            """
+            <div className=\"panel\">
+              <h2 className=\"section-title\">Dashboard System</h2>
+              <div className=\"grid grid-3\">
+                <div className=\"card panel\"><strong>Recent activity</strong><div className=\"muted\">Last actions and status updates.</div></div>
+                <div className=\"card panel\"><strong>Stats</strong><div className=\"muted\">KPI placeholders connected to backend health and stored data.</div></div>
+                <div className=\"card panel\"><strong>Quick actions</strong><div className=\"muted\">Fast launch buttons for the most common workflows.</div></div>
+              </div>
+            </div>
+            """
+        )
+    if "ai-tools" in ctx.systems:
+        sections.append(
+            """
+            <div className=\"panel\">
+              <h2 className=\"section-title\">AI Tools System</h2>
+              <div className=\"grid grid-2\">
+                <div className=\"card panel\"><strong>Assistant</strong><div className=\"muted\">Prompt-driven workflow placeholder.</div></div>
+                <div className=\"card panel\"><strong>Scan / Analyze</strong><div className=\"muted\">Upload, inspect, and return structured results.</div></div>
+              </div>
+            </div>
+            """
+        )
+    if "storage" in ctx.systems:
+        sections.append(
+            """
+            <div className=\"panel\">
+              <h2 className=\"section-title\">Storage System</h2>
+              <ul className=\"list\">
+                <li>Saved records</li>
+                <li>History timeline</li>
+                <li>Persistence strategy: API + local fallback</li>
+              </ul>
+            </div>
+            """
+        )
+    if "billing" in ctx.systems:
+        sections.append(
+            """
+            <div className=\"panel\">
+              <h2 className=\"section-title\">Billing System</h2>
+              <div className=\"muted\">Plan cards and subscription-gating placeholders are included for future Stripe connection.</div>
+            </div>
+            """
+        )
+    if "admin" in ctx.systems:
+        sections.append(
+            """
+            <div className=\"panel\">
+              <h2 className=\"section-title\">Admin System</h2>
+              <div className=\"muted\">Role-based portal placeholder with monitoring and management sections.</div>
+            </div>
+            """
+        )
+
+    sections_markup = "\n".join(s.strip() for s in sections) or (
+        '<div className="panel"><h2 className="section-title">Core App</h2><div className="muted">Starter workspace ready for new systems.</div></div>'
+    )
+
+    return textwrap.dedent(
+        f"""
+        import {{ Link }} from 'react-router-dom'
+        import {{ appRoutes }} from './config/routes'
+        import {{ systemRegistry }} from './config/systemRegistry'
+
+        const health = {{
+          frontend: 'ready',
+          backend: '{ctx.backend}',
+          storage: '{ctx.storage}',
+          auth: '{ctx.auth}',
+          billing: '{ctx.billing}',
+          ai: '{ctx.ai_mode}',
+        }}
+
+        export default function App() {{
+          const systems = Object.entries(systemRegistry)
+
+          return (
+            <div className="app-shell">
+              <div className="topbar">
+                <div>
+                  <div className="mini">AI Builder • System-aware app</div>
+                  <h1>{ctx.app_name}</h1>
+                  <div className="muted">{ctx.idea}</div>
+                </div>
+                <button className="cta">Primary action</button>
+              </div>
+
+              <div className="hero">
+                <div className="stack">
+                  <span className="chip">Complexity: {ctx.complexity}</span>
+                  <span className="chip">Frontend: {ctx.frontend}</span>
+                  <span className="chip">Backend: {ctx.backend}</span>
+                  <span className="chip">Storage: {ctx.storage}</span>
+                </div>
+
+                <div className="nav">
+                  {{appRoutes.map((route) => (
+                    <Link key={{route.path}} to={{route.path}} className="chip">
+                      {{route.label}}
+                    </Link>
+                  ))}}
+                </div>
+              </div>
+
+              <div style={{{{ height: 16 }}}} />
+
+              <div className="grid grid-2">
+                <div className="panel">
+                  <h2 className="section-title">Detected systems</h2>
+                  <div className="route-list">
+                    {{systems.map(([key, value]) => (
+                      <div key={{key}} className="route-card">
+                        <strong>{{value.title}}</strong>
+                        <div className="muted">{{value.summary}}</div>
+                        <div className="mini">System key: {{key}}</div>
+                      </div>
+                    ))}}
+                  </div>
+                </div>
+
+                <div className="panel">
+                  <h2 className="section-title">Project health</h2>
+                  <div className="route-list">
+                    {{Object.entries(health).map(([k, v]) => (
+                      <div key={{k}} className="route-card">
+                        <strong>{{k}}</strong>
+                        <div className="muted">{{v}}</div>
+                      </div>
+                    ))}}
+                  </div>
+                </div>
+              </div>
+
+              <div style={{{{ height: 16 }}}} />
+
+              {sections_markup}
+            </div>
+          )
+        }}
+        """
+    ).strip() + "\n"
+
+
+def build_backend_main(ctx: BuildContext) -> str:
+    lines = [
+        "from fastapi import FastAPI",
+        "from fastapi.middleware.cors import CORSMiddleware",
+        "",
+        f"app = FastAPI(title={ctx.app_name!r})",
+        "",
+        "app.add_middleware(",
+        "    CORSMiddleware,",
+        "    allow_origins=['*'],",
+        "    allow_credentials=True,",
+        "    allow_methods=['*'],",
+        "    allow_headers=['*'],",
+        ")",
+        "",
+        "@app.get('/health')",
+        "def health():",
+        "    return {'status': 'ok', 'app': app.title}",
+        "",
+        "@app.get('/systems')",
+        "def systems():",
+        f"    return {{'systems': {safe_json(ctx.systems)}}}",
     ]
 
-    if app_type == "admin panel":
-        files += [
-            {"path": "src/pages/DashboardPage.jsx", "language": "javascript", "content": dashboard_page_code(prompt)},
-            {"path": "src/components/Sidebar.jsx", "language": "javascript", "content": sidebar_code()},
-            {"path": "src/components/KpiCard.jsx", "language": "javascript", "content": kpi_card_code()},
-            {"path": "src/components/InspectorPanel.jsx", "language": "javascript", "content": inspector_code()},
-        ]
-    elif app_type == "assistant app":
-        files += [
-            {"path": "src/pages/AssistantPage.jsx", "language": "javascript", "content": assistant_page_code(prompt)},
-            {"path": "src/components/ChatShell.jsx", "language": "javascript", "content": chat_shell_code()},
-            {"path": "src/components/ToolRail.jsx", "language": "javascript", "content": tool_rail_code()},
-            {"path": "src/components/MemoryPanel.jsx", "language": "javascript", "content": memory_panel_code()},
-        ]
-    elif app_type == "content app":
-        files += [
-            {"path": "src/pages/StudioPage.jsx", "language": "javascript", "content": studio_page_code(prompt)},
-            {"path": "src/components/EditorShell.jsx", "language": "javascript", "content": editor_shell_code()},
-            {"path": "src/components/PreviewPanel.jsx", "language": "javascript", "content": preview_panel_code()},
-            {"path": "src/components/NotesPanel.jsx", "language": "javascript", "content": notes_panel_code()},
-        ]
-    else:
-        files += [
-            {"path": "src/pages/ToolPage.jsx", "language": "javascript", "content": tool_page_code(prompt, builder_mode == "battery-planner")},
-            {"path": "src/components/CalculatorForm.jsx", "language": "javascript", "content": calculator_form_code()},
-            {"path": "src/components/ResultsPanel.jsx", "language": "javascript", "content": results_panel_code()},
-            {"path": "src/components/ExportActions.jsx", "language": "javascript", "content": export_actions_code()},
-        ]
+    if "ai-tools" in ctx.systems:
+        lines.extend(
+            [
+                "",
+                "@app.post('/analyze')",
+                "def analyze(payload: dict):",
+                "    text = payload.get('text') or payload.get('input') or ''",
+                "    return {",
+                "        'ok': True,",
+                "        'mode': 'mock-ai',",
+                "        'summary': f'Processed input of length {len(text)}',",
+                "        'next_steps': ['Review result', 'Store result', 'Refine prompt'],",
+                "    }",
+            ]
+        )
 
-    if re.search(r"(auth|login|signin|sign in)", prompt.lower()):
-        files += [
-            {"path": "src/pages/LoginPage.jsx", "language": "javascript", "content": login_page_code()},
-            {"path": "src/lib/auth.js", "language": "javascript", "content": auth_code()},
-        ]
+    if "storage" in ctx.systems:
+        lines.extend(
+            [
+                "",
+                "STORE = []",
+                "",
+                "@app.get('/records')",
+                "def list_records():",
+                "    return {'items': STORE}",
+                "",
+                "@app.post('/records')",
+                "def create_record(payload: dict):",
+                "    STORE.append(payload)",
+                "    return {'ok': True, 'count': len(STORE), 'item': payload}",
+            ]
+        )
 
-    if builder_mode == "battery-planner":
-        files += [
-            {"path": "src/lib/batteryMath.js", "language": "javascript", "content": battery_math_code()},
-            {"path": "src/components/ApplianceTable.jsx", "language": "javascript", "content": appliance_table_code()},
+    return "\n".join(lines).strip() + "\n"
+
+
+def build_backend_requirements() -> str:
+    return "fastapi\nuvicorn[standard]\npydantic\n\n"
+
+
+def build_env_example() -> str:
+    return textwrap.dedent(
+        """
+        VITE_API_BASE_URL=http://localhost:8000
+        OPENAI_API_KEY=
+        DATABASE_URL=
+        STRIPE_SECRET_KEY=
+        """
+    ).strip() + "\n"
+
+
+def build_gitignore() -> str:
+    return textwrap.dedent(
+        """
+        node_modules/
+        dist/
+        .venv/
+        __pycache__/
+        *.pyc
+        .env
+        .DS_Store
+        """
+    ).strip() + "\n"
+
+
+def build_system_plan_json(ctx: BuildContext) -> str:
+    plan = {
+        "appName": ctx.app_name,
+        "idea": ctx.idea,
+        "systems": ctx.systems,
+        "complexity": ctx.complexity,
+        "architecture": {
+            "frontend": ctx.frontend,
+            "backend": ctx.backend,
+            "storage": ctx.storage,
+            "auth": ctx.auth,
+            "billing": ctx.billing,
+            "aiMode": ctx.ai_mode,
+        },
+        "notes": ctx.notes,
+    }
+    return safe_json(plan) + "\n"
+
+
+def build_generated_files(ctx: BuildContext) -> List[GeneratedFile]:
+    files: List[GeneratedFile] = []
+
+    files.extend(
+        [
+            GeneratedFile("README.md", build_readme(ctx), "doc", "core"),
+            GeneratedFile(".gitignore", build_gitignore(), "config", "core"),
+            GeneratedFile(".env.example", build_env_example(), "config", "core"),
+            GeneratedFile("builder/system-plan.json", build_system_plan_json(ctx), "config", "core"),
+            GeneratedFile("frontend/package.json", build_frontend_package_json(ctx), "config", "core"),
+            GeneratedFile("frontend/vite.config.js", build_frontend_vite_config(), "config", "core"),
+            GeneratedFile("frontend/index.html", build_frontend_index_html(ctx), "markup", "core"),
+            GeneratedFile("frontend/src/main.jsx", build_frontend_main(), "code", "core"),
+            GeneratedFile("frontend/src/styles.css", build_frontend_styles(), "style", "core"),
+            GeneratedFile("frontend/src/App.jsx", build_app_component(ctx), "code", "core"),
+            GeneratedFile("frontend/src/config/routes.js", build_routes_file(ctx), "code", "core"),
+            GeneratedFile("frontend/src/config/systemRegistry.js", build_system_registry(ctx), "code", "core"),
+            GeneratedFile("backend/main.py", build_backend_main(ctx), "code", "core"),
+            GeneratedFile("backend/requirements.txt", build_backend_requirements(), "config", "core"),
         ]
+    )
+
+    if "auth" in ctx.systems:
+        files.append(
+            GeneratedFile(
+                "frontend/src/systems/auth/auth.config.js",
+                "export const authConfig = { mode: 'demo', protectedRoutes: ['/settings', '/dashboard'] }\n",
+                "code",
+                "auth",
+            )
+        )
+
+    if "billing" in ctx.systems:
+        files.append(
+            GeneratedFile(
+                "frontend/src/systems/billing/plans.js",
+                "export const plans = [{ id: 'free', name: 'Free' }, { id: 'pro', name: 'Pro' }]\n",
+                "code",
+                "billing",
+            )
+        )
+
+    if "storage" in ctx.systems:
+        files.append(
+            GeneratedFile(
+                "frontend/src/systems/storage/storage.client.js",
+                textwrap.dedent(
+                    """
+                    export async function fetchRecords(apiBase) {
+                      const res = await fetch(`${apiBase}/records`)
+                      if (!res.ok) throw new Error('Failed to fetch records')
+                      return res.json()
+                    }
+                    """
+                ).strip() + "\n",
+                "code",
+                "storage",
+            )
+        )
+
+    if "ai-tools" in ctx.systems:
+        files.append(
+            GeneratedFile(
+                "frontend/src/systems/ai/ai.client.js",
+                textwrap.dedent(
+                    """
+                    export async function analyzeInput(apiBase, text) {
+                      const res = await fetch(`${apiBase}/analyze`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ text }),
+                      })
+                      if (!res.ok) throw new Error('Failed to analyze input')
+                      return res.json()
+                    }
+                    """
+                ).strip() + "\n",
+                "code",
+                "ai-tools",
+            )
+        )
 
     return files
 
 
-@app.post("/mutate")
-def mutate(payload: MutateRequest):
-    prompt = payload.prompt.strip()
-    app_type = infer_app_type(prompt)
-    builder_mode = infer_builder_mode(prompt)
-    summary_style = infer_summary_style(prompt)
-    modules = recommend_modules(prompt, app_type)
-    layout = build_layout(prompt, payload.current_layout)
-    file_tree = build_file_tree(app_type, builder_mode, prompt)
-    routes = build_routes(app_type, prompt)
-    components = build_components(app_type, prompt)
-    summary = build_mutation_summary(layout, modules, app_type, builder_mode)
+def mutate_files(req: MutateRequest) -> List[Dict[str, Any]]:
+    files = req.files or []
+    instruction = req.instruction.strip().lower()
+    result: List[Dict[str, Any]] = []
 
+    for file in files:
+        path = file.get("path", "")
+        content = file.get("content", "")
+        new_content = content
+
+        if path.endswith("frontend/src/styles.css") and "dark" in instruction:
+            if ".theme-dark" not in content:
+                new_content += "\n.theme-dark { filter: saturate(1.05); }\n"
+
+        if path.endswith("frontend/src/App.jsx"):
+            if "sidebar" in instruction and "Workspace Rail" not in content:
+                insert = textwrap.dedent(
+                    """
+                    <div className=\"panel\" style={{ marginBottom: 16 }}>
+                      <h2 className=\"section-title\">Workspace Rail</h2>
+                      <div className=\"muted\">Mutation added a simple sidebar placeholder for navigation and tools.</div>
+                    </div>
+                    """
+                ).strip()
+                new_content = content.replace('<div style={{ height: 16 }} />', insert + '\n\n              <div style={{ height: 16 }} />', 1)
+
+            if "mobile" in instruction and "Built for smaller screens" not in new_content:
+                new_content = new_content.replace(
+                    "<div className=\"muted\">{ctx.idea}</div>",
+                    "<div className=\"muted\">{ctx.idea}</div>\n                  <div className=\"mini\">Built for smaller screens and touch-first flows.</div>",
+                ) if "{ctx.idea}" in new_content else new_content
+
+        file_copy = dict(file)
+        file_copy["content"] = new_content
+        result.append(file_copy)
+
+    return result
+
+
+# -----------------------------------------------------------------------------
+# Routes
+# -----------------------------------------------------------------------------
+
+@app.get("/")
+def root() -> Dict[str, Any]:
     return {
-        "ok": True,
-        "prompt": prompt,
-        "app_type": app_type,
-        "builder_mode": builder_mode,
-        "summary_style": summary_style,
-        "layout_changes": layout,
-        "module_changes": {"enable": modules, "disable": []},
-        "file_tree": file_tree,
-        "routes": routes,
-        "components": components,
-        "mutation_summary": summary,
-        "next_best_actions": [
-            "materialize files",
-            "regenerate routes",
-            "add inspector",
-            "focus preview",
-            "generate code",
-        ],
+        "status": "ok",
+        "service": "builder-backend",
+        "version": "2.0-system-aware",
+        "routes": ["/health", "/generate-code", "/mutate"],
+    }
+
+
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    return {
+        "status": "ok",
+        "service": "builder-backend",
+        "version": "2.0-system-aware",
+        "openai": bool(os.getenv("OPENAI_API_KEY")),
     }
 
 
 @app.post("/generate-code")
-def generate_code(payload: GenerateCodeRequest):
-    prompt = payload.prompt.strip()
-    app_type = payload.app_type or infer_app_type(prompt)
-    builder_mode = payload.builder_mode or infer_builder_mode(prompt)
-    style = payload.style or "dark glass"
-
-    files = generate_code_bundle(prompt, app_type, builder_mode, style)
-    routes = payload.routes or build_routes(app_type, prompt)
-    components = payload.components or build_components(app_type, prompt)
+def generate_code(req: GenerateCodeRequest) -> Dict[str, Any]:
+    ctx = infer_context(req)
+    files = build_generated_files(ctx)
+    zip_bytes = create_zip_bytes(files)
 
     return {
         "ok": True,
-        "prompt": prompt,
-        "app_type": app_type,
-        "builder_mode": builder_mode,
-        "style": style,
-        "generated_files": files,
-        "routes": routes,
-        "components": components,
-        "entry_file": "src/main.jsx",
-        "app_file": "src/App.jsx",
-        "summary": f"Generated {len(files)} starter files for a {app_type} in {builder_mode} mode.",
+        "app_name": ctx.app_name,
+        "slug": ctx.slug,
+        "systems": ctx.systems,
+        "complexity": ctx.complexity,
+        "architecture": {
+            "frontend": ctx.frontend,
+            "backend": ctx.backend,
+            "storage": ctx.storage,
+            "auth": ctx.auth,
+            "billing": ctx.billing,
+            "aiMode": ctx.ai_mode,
+        },
+        "files": [item.to_dict() for item in files],
+        "zip": {
+            "filename": f"{ctx.slug}.zip",
+            "bytes": len(zip_bytes),
+        },
+        "planner": {
+            "systemsDetected": ctx.systems,
+            "notes": ctx.notes,
+        },
     }
+
+
+@app.post("/mutate")
+def mutate(req: MutateRequest) -> Dict[str, Any]:
+    mutated_files = mutate_files(req)
+    return {
+        "ok": True,
+        "instruction": req.instruction,
+        "systems": normalize_systems(req.instruction, req.systems),
+        "files": mutated_files,
+        "summary": {
+            "filesChanged": len(mutated_files),
+            "complexity": req.complexity,
+        },
+    }
+
