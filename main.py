@@ -5,6 +5,9 @@ from typing import List, Dict, Any, Optional
 import re
 import json
 
+BACKEND_NAME = "builder-backend-v6"
+BACKEND_VERSION = "data-flow-v1"
+
 app = FastAPI(title="Builder Backend v6 - Data Flow Generator")
 
 app.add_middleware(
@@ -22,12 +25,17 @@ app.add_middleware(
 
 @app.get("/")
 def home():
-    return {"status": "ok", "service": "builder-backend-v6"}
+    return {"status": "ok", "service": BACKEND_NAME, "version": BACKEND_VERSION}
 
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "service": "builder-backend-v6", "data_flow": True}
+    return {
+        "status": "healthy",
+        "service": BACKEND_NAME,
+        "version": BACKEND_VERSION,
+        "data_flow": True,
+    }
 
 
 class ApplianceItem(BaseModel):
