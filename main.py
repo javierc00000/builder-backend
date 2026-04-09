@@ -1,14 +1,11 @@
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
-import json
 import re
+import json
 
-
-app = FastAPI(title="Builder Backend v4 - Merged Final")
-
+app = FastAPI(title="Builder Backend v6 - Data Flow Generator")
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,21 +22,12 @@ app.add_middleware(
 
 @app.get("/")
 def home():
-    return {"status": "ok", "service": "builder-backend-v4-merged"}
+    return {"status": "ok", "service": "builder-backend-v6"}
 
 
 @app.get("/health")
 def health():
-    return {
-        "status": "healthy",
-        "service": "builder-backend-v4-merged",
-        "features": {
-            "mutate": True,
-            "generate_code": True,
-            "system_planner": True,
-            "persistence_aware": True,
-        },
-    }
+    return {"status": "healthy", "service": "builder-backend-v6", "data_flow": True}
 
 
 class ApplianceItem(BaseModel):
@@ -56,31 +44,14 @@ class BatteryPlanRequest(BaseModel):
     system_loss: float = 0.2
 
 
-@app.post("/battery-plan")
-def battery_plan(payload: BatteryPlanRequest):
-    daily_wh = sum(max(item.watts, 0) * max(item.hours, 0) for item in payload.appliances)
-    adjusted_daily_wh = daily_wh * (1 + max(payload.system_loss, 0))
-    battery_ah = round((adjusted_daily_wh * max(payload.autonomy_days, 1)) / max(payload.battery_voltage, 1), 1)
-    solar_watts = round(adjusted_daily_wh / max(payload.sun_hours, 1), 1)
-
-    return {
-        "daily_wh": round(daily_wh, 1),
-        "adjusted_daily_wh": round(adjusted_daily_wh, 1),
-        "battery_ah": battery_ah,
-        "solar_watts": solar_watts,
-        "summary": f"For this setup, plan for about {battery_ah}Ah of battery and {solar_watts}W of solar."
-    }
-
-
 class MutateRequest(BaseModel):
     prompt: str
     current_layout: Dict[str, Any] = Field(default_factory=dict)
     active_modules: List[str] = Field(default_factory=list)
     feature_state: Dict[str, Any] = Field(default_factory=dict)
     systems: List[str] = Field(default_factory=list)
-    complexity: str = "starter"
+    complexity: str = ""
     architecture: Dict[str, Any] = Field(default_factory=dict)
-    persistence_mode: str = ""
 
 
 class GenerateCodeRequest(BaseModel):
@@ -91,16 +62,24 @@ class GenerateCodeRequest(BaseModel):
     routes: List[Dict[str, Any]] = Field(default_factory=list)
     components: List[Dict[str, Any]] = Field(default_factory=list)
     systems: List[str] = Field(default_factory=list)
-    complexity: str = "starter"
+    complexity: str = "mvp"
     architecture: Dict[str, Any] = Field(default_factory=dict)
-    persistence_mode: str = ""
-    project_name: str = ""
-    include_backend: bool = True
+    persistence: str = ""
 
 
-def slugify(text: str, fallback: str = "generated-app") -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
-    return slug[:60] or fallback
+@app.post("/battery-plan")
+def battery_plan(payload: BatteryPlanRequest):
+    daily_wh = sum(max(item.watts, 0) * max(item.hours, 0) for item in payload.appliances)
+    adjusted_daily_wh = daily_wh * (1 + max(payload.system_loss, 0))
+    battery_ah = round((adjusted_daily_wh * max(payload.autonomy_days, 1)) / max(payload.battery_voltage, 1), 1)
+    solar_watts = round(adjusted_daily_wh / max(payload.sun_hours, 1), 1)
+    return {
+        "daily_wh": round(daily_wh, 1),
+        "adjusted_daily_wh": round(adjusted_daily_wh, 1),
+        "battery_ah": battery_ah,
+        "solar_watts": solar_watts,
+        "summary": f"For this setup, plan for about {battery_ah}Ah of battery and {solar_watts}W of solar.",
+    }
 
 
 def infer_app_type(prompt: str) -> str:
@@ -136,6 +115,42 @@ def infer_summary_style(prompt: str) -> str:
     return "balanced"
 
 
+def infer_systems(prompt: str, app_type: str) -> List[str]:
+    p = prompt.lower()
+    systems = set()
+    if app_type == "admin panel":
+        systems.update(["dashboard", "storage", "settings"])
+    elif app_type == "assistant app":
+        systems.update(["ai-tools", "storage", "settings"])
+    elif app_type == "content app":
+        systems.update(["storage", "settings"])
+    else:
+        systems.update(["storage"])
+
+    if re.search(r"(login|auth|account|signin|sign in|register|user)", p):
+        systems.add("auth")
+    if re.search(r"(billing|subscription|stripe|paywall|pro|premium)", p):
+        systems.add("billing")
+    if re.search(r"(scan|diagnostic|ai|assistant|chat|analysis)", p):
+        systems.add("ai-tools")
+    if re.search(r"(admin|team|portal|role|dealer|tech)", p):
+        systems.add("admin")
+    if re.search(r"(settings|preferences|profile)", p):
+        systems.add("settings")
+    if re.search(r"(dashboard|stats|analytics|reports)", p):
+        systems.add("dashboard")
+    return sorted(systems)
+
+
+def infer_persistence(prompt: str, systems: List[str], complexity: str) -> str:
+    p = prompt.lower()
+    if "billing" in systems or "auth" in systems or complexity == "product":
+        return "supabase"
+    if re.search(r"(local|offline|desktop|mvp|sqlite|history|saved)", p) or complexity == "mvp":
+        return "sqlite"
+    return "localstorage"
+
+
 def recommend_modules(prompt: str, app_type: str) -> List[str]:
     p = prompt.lower()
     modules = {
@@ -148,17 +163,15 @@ def recommend_modules(prompt: str, app_type: str) -> List[str]:
     }
     if app_type == "admin panel":
         modules.update({"dashboard_shell", "sidebar_navigation", "split_workspace"})
-    if app_type == "assistant app":
-        modules.update({"split_workspace", "notes_panel"})
-    if app_type == "content app":
-        modules.update({"notes_panel", "split_workspace"})
-    if app_type == "tool app":
-        modules.update({"split_workspace"})
+    if app_type in {"assistant app", "content app", "tool app"}:
+        modules.add("split_workspace")
+    if app_type in {"assistant app", "content app"}:
+        modules.add("notes_panel")
     if re.search(r"(battery|solar|power|calculator|tool)", p):
         modules.add("calculator_engine")
     if re.search(r"(affiliate|amazon|monetize|shop)", p):
         modules.add("affiliate_suggestions")
-    if re.search(r"(export|report|download|pdf|zip)", p):
+    if re.search(r"(export|report|download|pdf)", p):
         modules.add("export_report")
     if re.search(r"(sidebar|navigation|rail)", p):
         modules.add("sidebar_navigation")
@@ -166,88 +179,7 @@ def recommend_modules(prompt: str, app_type: str) -> List[str]:
         modules.add("notes_panel")
     if re.search(r"(dashboard|crm|saas)", p):
         modules.add("dashboard_shell")
-    if re.search(r"(split|two column|2 column|2-column)", p):
-        modules.add("split_workspace")
-    if re.search(r"(preview|runner|sandbox)", p):
-        modules.add("preview_runner")
     return sorted(modules)
-
-
-def infer_systems(prompt: str, app_type: str, builder_mode: str, selected: Optional[List[str]] = None) -> List[str]:
-    systems = set(selected or [])
-    p = prompt.lower()
-
-    if app_type == "admin panel":
-        systems.update({"dashboard", "settings"})
-    elif app_type == "assistant app":
-        systems.update({"ai-tools", "storage", "settings"})
-    elif app_type == "content app":
-        systems.update({"dashboard", "storage", "settings"})
-    else:
-        systems.update({"tools", "storage"})
-
-    if builder_mode == "battery-planner":
-        systems.update({"tools", "storage"})
-
-    if re.search(r"(auth|login|signin|sign in|account|user profile|signup|register)", p):
-        systems.add("auth")
-    if re.search(r"(billing|payment|paywall|stripe|subscription|pro plan|pricing)", p):
-        systems.add("billing")
-    if re.search(r"(dashboard|analytics|admin|panel|overview)", p):
-        systems.add("dashboard")
-    if re.search(r"(save|history|database|data|reports|records|folder|saved)", p):
-        systems.add("storage")
-    if re.search(r"(settings|preferences|profile)", p):
-        systems.add("settings")
-    if re.search(r"(scan|ai|assistant|chat|diagnostic|copilot|vision)", p):
-        systems.add("ai-tools")
-    if re.search(r"(tool|calculator|planner|converter)", p):
-        systems.add("tools")
-    if re.search(r"(portal|admin|staff|dealer|tech|role)", p):
-        systems.add("roles")
-
-    return sorted(systems)
-
-
-def infer_complexity(prompt: str, incoming: str = "") -> str:
-    c = (incoming or "").strip().lower()
-    if c in {"starter", "mvp", "product"}:
-        return c
-    p = prompt.lower()
-    if re.search(r"(full product|complete product|saas|production|multi page|auth|billing|dashboard)", p):
-        return "product"
-    if re.search(r"(mvp|prototype|working app|save data)", p):
-        return "mvp"
-    return "starter"
-
-
-def infer_persistence_mode(prompt: str, systems: List[str], complexity: str, requested: str = "") -> str:
-    req = (requested or "").strip().lower()
-    if req in {"localstorage", "sqlite", "supabase"}:
-        return req
-    p = prompt.lower()
-    if "billing" in systems or re.search(r"(cloud|supabase|online users|real auth|shared data)", p):
-        return "supabase" if complexity == "product" else "sqlite"
-    if "auth" in systems or "storage" in systems:
-        return "sqlite" if complexity in {"mvp", "product"} else "localstorage"
-    return "localstorage"
-
-
-def build_architecture(prompt: str, app_type: str, builder_mode: str, systems: List[str], complexity: str, persistence_mode: str, incoming: Dict[str, Any]) -> Dict[str, Any]:
-    arch = dict(incoming or {})
-    arch.setdefault("frontend", "react-vite")
-    arch.setdefault("backend", "fastapi")
-    arch.setdefault("styling", "css")
-    arch.setdefault("routing", "react-router-dom")
-    arch.setdefault("state", "react-state")
-    arch["app_type"] = app_type
-    arch["builder_mode"] = builder_mode
-    arch["complexity"] = complexity
-    arch["systems"] = systems
-    arch["persistence"] = persistence_mode
-    arch["api"] = "fastapi-json"
-    arch["preview"] = "live-preview-runner"
-    return arch
 
 
 def build_layout(prompt: str, current_layout: Dict[str, Any]) -> Dict[str, Any]:
@@ -262,35 +194,19 @@ def build_layout(prompt: str, current_layout: Dict[str, Any]) -> Dict[str, Any]:
         "dense": current_layout.get("dense", False),
         "previewStyle": current_layout.get("previewStyle", "wireframe"),
         "panels": {
-            "sidebar": list(current_layout.get("panels", {}).get("sidebar", ["builder", "results", "modules", "mutations", "systems"])),
+            "sidebar": list(current_layout.get("panels", {}).get("sidebar", ["builder", "results", "modules", "mutations"])),
             "mainTop": list(current_layout.get("panels", {}).get("mainTop", ["brain", "command", "quickActions"])),
             "mainBottom": list(current_layout.get("panels", {}).get("mainBottom", ["planner", "results", "preview"])),
-            "inspector": list(current_layout.get("panels", {}).get("inspector", ["status", "affiliate", "notes", "architecture"])),
+            "inspector": list(current_layout.get("panels", {}).get("inspector", ["status", "affiliate", "notes"])),
         },
     }
     p = prompt.lower()
     if re.search(r"(dashboard|crm|saas)", p):
-        layout["mode"] = "dashboard"
-        layout["shell"] = "dashboard"
-        layout["sidebar"] = True
-        layout["split"] = True
-        layout["inspector"] = True
-        layout["previewStyle"] = "dashboard"
-    if re.search(r"(assistant|copilot|agent)", p):
-        layout["mode"] = "workspace"
-        layout["shell"] = "classic"
-        layout["split"] = True
-        layout["inspector"] = True
-    if re.search(r"(content|editor|writer|studio)", p):
-        layout["mode"] = "workspace"
-        layout["shell"] = "classic"
-        layout["split"] = True
-        layout["inspector"] = True
+        layout.update({"mode": "dashboard", "shell": "dashboard", "sidebar": True, "split": True, "inspector": True, "previewStyle": "dashboard"})
+    if re.search(r"(assistant|copilot|agent|content|editor|writer|studio)", p):
+        layout.update({"mode": "workspace", "shell": "classic", "split": True, "inspector": True})
     if re.search(r"(focus preview|preview first|canvas focus)", p):
-        layout["mode"] = "focus"
-        layout["shell"] = "focus"
-        layout["split"] = True
-        layout["previewStyle"] = "spotlight"
+        layout.update({"mode": "focus", "shell": "focus", "split": True, "previewStyle": "spotlight"})
     if re.search(r"(dense|compact)", p):
         layout["dense"] = True
     if re.search(r"(spacious|comfortable|relaxed)", p):
@@ -304,7 +220,7 @@ def build_layout(prompt: str, current_layout: Dict[str, Any]) -> Dict[str, Any]:
     return layout
 
 
-def build_file_tree(app_type: str, builder_mode: str, prompt: str, systems: List[str], persistence_mode: str) -> List[Dict[str, Any]]:
+def build_file_tree(app_type: str, builder_mode: str, prompt: str, systems: List[str], persistence: str) -> List[Dict[str, Any]]:
     base = [
         {"path": "frontend/src/App.jsx", "kind": "file", "role": "root app"},
         {"path": "frontend/src/main.jsx", "kind": "file", "role": "entry"},
@@ -312,10 +228,9 @@ def build_file_tree(app_type: str, builder_mode: str, prompt: str, systems: List
         {"path": "frontend/src/components", "kind": "folder", "role": "ui components"},
         {"path": "frontend/src/pages", "kind": "folder", "role": "pages"},
         {"path": "frontend/src/lib", "kind": "folder", "role": "helpers"},
-        {"path": "backend", "kind": "folder", "role": "api server"},
-        {"path": "backend/main.py", "kind": "file", "role": "backend app"},
+        {"path": "backend/main.py", "kind": "file", "role": "api server"},
+        {"path": "backend/requirements.txt", "kind": "file", "role": "backend deps"},
     ]
-
     if app_type == "admin panel":
         base += [
             {"path": "frontend/src/pages/DashboardPage.jsx", "kind": "file", "role": "dashboard page"},
@@ -344,54 +259,26 @@ def build_file_tree(app_type: str, builder_mode: str, prompt: str, systems: List
             {"path": "frontend/src/components/ResultsPanel.jsx", "kind": "file", "role": "tool output"},
             {"path": "frontend/src/components/ExportActions.jsx", "kind": "file", "role": "export controls"},
         ]
-
+    if "auth" in systems:
+        base += [
+            {"path": "frontend/src/pages/LoginPage.jsx", "kind": "file", "role": "authentication"},
+            {"path": "frontend/src/lib/auth.js", "kind": "file", "role": "auth helpers"},
+        ]
+    if "storage" in systems:
+        base += [
+            {"path": "frontend/src/lib/api.js", "kind": "file", "role": "api client"},
+            {"path": "frontend/src/hooks/useItems.js", "kind": "file", "role": "data hook"},
+            {"path": "backend/data_store.py", "kind": "file", "role": f"{persistence} storage layer"},
+        ]
     if builder_mode == "battery-planner":
         base += [
             {"path": "frontend/src/lib/batteryMath.js", "kind": "file", "role": "calculation logic"},
             {"path": "frontend/src/components/ApplianceTable.jsx", "kind": "file", "role": "appliance rows"},
         ]
-
-    if "auth" in systems:
-        base += [
-            {"path": "frontend/src/pages/LoginPage.jsx", "kind": "file", "role": "authentication"},
-            {"path": "frontend/src/pages/RegisterPage.jsx", "kind": "file", "role": "registration"},
-            {"path": "frontend/src/lib/auth.js", "kind": "file", "role": "auth helpers"},
-            {"path": "backend/routes/auth.py", "kind": "file", "role": "auth endpoints"},
-        ]
-    if "storage" in systems:
-        base += [
-            {"path": "frontend/src/lib/storage.js", "kind": "file", "role": "storage helpers"},
-            {"path": "backend/routes/storage.py", "kind": "file", "role": "storage endpoints"},
-        ]
-    if "billing" in systems:
-        base += [
-            {"path": "frontend/src/pages/PricingPage.jsx", "kind": "file", "role": "pricing"},
-            {"path": "backend/routes/billing.py", "kind": "file", "role": "billing endpoints"},
-        ]
-    if "settings" in systems:
-        base += [
-            {"path": "frontend/src/pages/SettingsPage.jsx", "kind": "file", "role": "settings"},
-        ]
-    if "ai-tools" in systems:
-        base += [
-            {"path": "frontend/src/pages/ScanPage.jsx", "kind": "file", "role": "ai scan / diagnostics"},
-            {"path": "backend/routes/ai_tools.py", "kind": "file", "role": "ai tool endpoints"},
-        ]
-    if persistence_mode == "sqlite":
-        base += [
-            {"path": "backend/db.py", "kind": "file", "role": "sqlite helpers"},
-        ]
-    if persistence_mode == "supabase":
-        base += [
-            {"path": "backend/supabase_client.py", "kind": "file", "role": "supabase helpers"},
-            {"path": "backend/supabase_schema.sql", "kind": "file", "role": "database schema"},
-        ]
-
     return base
 
 
-def build_routes(app_type: str, prompt: str, systems: Optional[List[str]] = None) -> List[Dict[str, str]]:
-    systems = systems or []
+def build_routes(app_type: str, prompt: str, systems: List[str]) -> List[Dict[str, str]]:
     routes = [{"path": "/", "component": "App", "reason": "root route"}]
     if app_type == "admin panel":
         routes += [
@@ -413,19 +300,12 @@ def build_routes(app_type: str, prompt: str, systems: Optional[List[str]] = None
             {"path": "/tool", "component": "ToolPage", "reason": "primary tool surface"},
             {"path": "/results", "component": "ResultsPage", "reason": "output view"},
         ]
-    if "auth" in systems or re.search(r"(auth|login|signin|sign in)", prompt.lower()):
+    if "auth" in systems:
         routes.append({"path": "/login", "component": "LoginPage", "reason": "auth entry"})
-    if "billing" in systems:
-        routes.append({"path": "/pricing", "component": "PricingPage", "reason": "billing / plans"})
-    if "settings" in systems and not any(r["path"] == "/settings" for r in routes):
-        routes.append({"path": "/settings", "component": "SettingsPage", "reason": "user preferences"})
-    if "ai-tools" in systems:
-        routes.append({"path": "/scan", "component": "ScanPage", "reason": "ai tool flow"})
     return routes
 
 
-def build_components(app_type: str, prompt: str, systems: Optional[List[str]] = None) -> List[Dict[str, str]]:
-    systems = systems or []
+def build_components(app_type: str, systems: List[str]) -> List[Dict[str, str]]:
     base = [
         {"name": "CommandBar", "purpose": "captures builder commands"},
         {"name": "LivePreview", "purpose": "renders structural preview"},
@@ -455,19 +335,14 @@ def build_components(app_type: str, prompt: str, systems: Optional[List[str]] = 
             {"name": "ResultsPanel", "purpose": "tool outputs"},
             {"name": "ExportActions", "purpose": "download/export actions"},
         ]
+    if "storage" in systems:
+        base.append({"name": "DataList", "purpose": "renders persisted records"})
     if "auth" in systems:
-        base += [
-            {"name": "ProtectedRoute", "purpose": "route protection"},
-            {"name": "AuthCard", "purpose": "auth forms"},
-        ]
-    if "billing" in systems:
-        base.append({"name": "PricingCard", "purpose": "plan selection"})
-    if "ai-tools" in systems:
-        base.append({"name": "ScanUploader", "purpose": "ai upload flow"})
+        base.append({"name": "AuthGate", "purpose": "guards protected screens"})
     return base
 
 
-def build_mutation_summary(layout: Dict[str, Any], modules: List[str], app_type: str, builder_mode: str, systems: List[str], complexity: str, persistence_mode: str) -> List[str]:
+def build_mutation_summary(layout: Dict[str, Any], modules: List[str], app_type: str, builder_mode: str, systems: List[str], persistence: str) -> List[str]:
     summary = [
         f"App type detected: {app_type}",
         f"Builder mode detected: {builder_mode}",
@@ -475,8 +350,7 @@ def build_mutation_summary(layout: Dict[str, Any], modules: List[str], app_type:
         f"Preview style: {layout['previewStyle']}",
         f"Active modules planned: {len(modules)}",
         f"Systems planned: {', '.join(systems) if systems else 'none'}",
-        f"Complexity mode: {complexity}",
-        f"Persistence mode: {persistence_mode}",
+        f"Persistence planned: {persistence}",
     ]
     if layout.get("sidebar"):
         summary.append("Sidebar enabled")
@@ -499,7 +373,6 @@ def app_css(style_name: str) -> str:
   --accent: #66d9ef;
   --accent-2: #8b5cf6;
 }
-
 * { box-sizing: border-box; }
 body {
   margin: 0;
@@ -508,83 +381,31 @@ body {
   color: var(--text);
 }
 button, input, textarea { font: inherit; }
-.app-shell {
-  min-height: 100vh;
-  padding: 24px;
-  display: grid;
-  gap: 18px;
-}
-.panel {
-  border: 1px solid var(--panel-border);
-  background: var(--panel);
-  border-radius: 20px;
-  padding: 18px;
-}
-.row {
-  display: grid;
-  gap: 18px;
-}
-.row.two {
-  grid-template-columns: 260px 1fr;
-}
-.row.three {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-}
-.pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  border-radius: 999px;
-  padding: 8px 12px;
-  border: 1px solid rgba(148, 163, 184, 0.18);
-  background: rgba(255,255,255,0.04);
-  color: var(--muted);
-}
-.primary-btn {
-  border: none;
-  border-radius: 999px;
-  padding: 12px 18px;
-  font-weight: 700;
-  cursor: pointer;
-  background: linear-gradient(135deg, var(--accent), var(--accent-2));
-  color: #07111f;
-}
+.app-shell { min-height: 100vh; padding: 24px; display: grid; gap: 18px; }
+.panel { border: 1px solid var(--panel-border); background: var(--panel); border-radius: 20px; padding: 18px; }
+.row { display: grid; gap: 18px; }
+.row.two { grid-template-columns: 260px 1fr; }
+.row.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.pill { display: inline-flex; align-items: center; gap: 8px; border-radius: 999px; padding: 8px 12px; border: 1px solid rgba(148, 163, 184, 0.18); background: rgba(255,255,255,0.04); color: var(--muted); }
+.primary-btn { border: none; border-radius: 999px; padding: 12px 18px; font-weight: 700; cursor: pointer; background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: #07111f; }
 .muted { color: var(--muted); }
-.card-grid {
-  display: grid;
-  gap: 12px;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-}
-.card {
-  border: 1px solid rgba(148,163,184,.14);
-  border-radius: 16px;
-  padding: 16px;
-  background: rgba(255,255,255,0.03);
-}
-.input {
-  width: 100%;
-  border-radius: 14px;
-  border: 1px solid rgba(148,163,184,.16);
-  background: rgba(255,255,255,.04);
-  color: var(--text);
-  padding: 12px 14px;
-}
-@media (max-width: 900px) {
-  .row.two, .row.three {
-    grid-template-columns: 1fr;
-  }
-}
+.card-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+.card { border: 1px solid rgba(148,163,184,.14); border-radius: 16px; padding: 16px; background: rgba(255,255,255,0.03); }
+.input { width: 100%; border-radius: 14px; border: 1px solid rgba(148,163,184,.16); background: rgba(255,255,255,.04); color: var(--text); padding: 12px 14px; }
+.list { display: grid; gap: 10px; margin-top: 12px; }
+.item { display: flex; justify-content: space-between; gap: 12px; padding: 12px; border: 1px solid rgba(148,163,184,.12); border-radius: 12px; background: rgba(255,255,255,.03); }
+@media (max-width: 900px) { .row.two, .row.three { grid-template-columns: 1fr; } }
 """.strip()
 
 
 def main_jsx() -> str:
     return """
-import React from "react";
-import ReactDOM from "react-dom/client";
-import App from "./App.jsx";
-import "./styles/app.css";
+import React from \"react\";
+import ReactDOM from \"react-dom/client\";
+import App from \"./App.jsx\";
+import \"./styles/app.css\";
 
-ReactDOM.createRoot(document.getElementById("root")).render(
+ReactDOM.createRoot(document.getElementById(\"root\")).render(
   <React.StrictMode>
     <App />
   </React.StrictMode>
@@ -592,17 +413,16 @@ ReactDOM.createRoot(document.getElementById("root")).render(
 """.strip()
 
 
-def root_app_code(app_type: str, prompt: str) -> str:
+def root_app_code(app_type: str) -> str:
     page_name = {
         "admin panel": "DashboardPage",
         "assistant app": "AssistantPage",
         "content app": "StudioPage",
         "tool app": "ToolPage",
     }.get(app_type, "ToolPage")
-
     return f"""
-import React from "react";
-import {{ {page_name} }} from "./pages/{page_name}.jsx";
+import React from \"react\";
+import {{ {page_name} }} from \"./pages/{page_name}.jsx\";
 
 export default function App() {{
   return <{page_name} />;
@@ -612,35 +432,37 @@ export default function App() {{
 
 def dashboard_page_code(prompt: str) -> str:
     return f"""
-import React from "react";
-import {{ Sidebar }} from "../components/Sidebar.jsx";
-import {{ KpiCard }} from "../components/KpiCard.jsx";
-import {{ InspectorPanel }} from "../components/InspectorPanel.jsx";
+import React, {{ useEffect, useState }} from \"react\";
+import {{ Sidebar }} from \"../components/Sidebar.jsx\";
+import {{ KpiCard }} from \"../components/KpiCard.jsx\";
+import {{ InspectorPanel }} from \"../components/InspectorPanel.jsx\";
+import {{ getItems }} from \"../lib/api.js\";
 
 export function DashboardPage() {{
-  return (
-    <div className="app-shell">
-      <div className="panel">
-        <div className="pill">Admin dashboard</div>
-        <h1>CRM Dashboard</h1>
-        <p className="muted">{prompt}</p>
-      </div>
+  const [items, setItems] = useState([]);
+  useEffect(() => {{ getItems().then(setItems).catch(() => setItems([])); }}, []);
 
-      <div className="row two">
+  return (
+    <div className=\"app-shell\">
+      <div className=\"panel\">
+        <div className=\"pill\">Admin dashboard</div>
+        <h1>CRM Dashboard</h1>
+        <p className=\"muted\">{prompt}</p>
+      </div>
+      <div className=\"row two\">
         <Sidebar />
-        <div className="row">
-          <div className="card-grid">
-            <KpiCard title="Revenue" value="$24.5k" />
-            <KpiCard title="Pipeline" value="42 deals" />
-            <KpiCard title="Tickets" value="18 open" />
+        <div className=\"row\">
+          <div className=\"card-grid\">
+            <KpiCard title=\"Records\" value={{String(items.length)}} />
+            <KpiCard title=\"Status\" value=\"Connected\" />
+            <KpiCard title=\"Flow\" value=\"Live API\" />
           </div>
-          <div className="panel">
-            <h2>Workspace</h2>
-            <p className="muted">This generated dashboard gives you a clean admin shell to continue building from.</p>
+          <div className=\"panel\">
+            <h2>Recent records</h2>
+            <div className=\"list\">{{items.map(item => <div className=\"item\" key={{item.id}}><span>{{item.title}}</span><span className=\"muted\">{{item.status}}</span></div>)}}</div>
           </div>
         </div>
       </div>
-
       <InspectorPanel />
     </div>
   );
@@ -650,26 +472,32 @@ export function DashboardPage() {{
 
 def assistant_page_code(prompt: str) -> str:
     return f"""
-import React from "react";
-import {{ ChatShell }} from "../components/ChatShell.jsx";
-import {{ ToolRail }} from "../components/ToolRail.jsx";
-import {{ MemoryPanel }} from "../components/MemoryPanel.jsx";
+import React, {{ useEffect, useState }} from \"react\";
+import {{ ChatShell }} from \"../components/ChatShell.jsx\";
+import {{ ToolRail }} from \"../components/ToolRail.jsx\";
+import {{ MemoryPanel }} from \"../components/MemoryPanel.jsx\";
+import {{ getItems }} from \"../lib/api.js\";
 
 export function AssistantPage() {{
-  return (
-    <div className="app-shell">
-      <div className="panel">
-        <div className="pill">Assistant workspace</div>
-        <h1>AI Assistant</h1>
-        <p className="muted">{prompt}</p>
-      </div>
+  const [items, setItems] = useState([]);
+  useEffect(() => {{ getItems().then(setItems).catch(() => setItems([])); }}, []);
 
-      <div className="row two">
+  return (
+    <div className=\"app-shell\">
+      <div className=\"panel\">
+        <div className=\"pill\">Assistant workspace</div>
+        <h1>AI Assistant</h1>
+        <p className=\"muted\">{prompt}</p>
+      </div>
+      <div className=\"row two\">
         <ToolRail />
         <ChatShell />
       </div>
-
       <MemoryPanel />
+      <section className=\"panel\">
+        <h3>Saved items</h3>
+        <div className=\"list\">{{items.map(item => <div className=\"item\" key={{item.id}}><span>{{item.title}}</span><span className=\"muted\">{{item.status}}</span></div>)}}</div>
+      </section>
     </div>
   );
 }}
@@ -678,25 +506,25 @@ export function AssistantPage() {{
 
 def studio_page_code(prompt: str) -> str:
     return f"""
-import React from "react";
-import {{ EditorShell }} from "../components/EditorShell.jsx";
-import {{ PreviewPanel }} from "../components/PreviewPanel.jsx";
-import {{ NotesPanel }} from "../components/NotesPanel.jsx";
+import React, {{ useState }} from \"react\";
+import {{ EditorShell }} from \"../components/EditorShell.jsx\";
+import {{ PreviewPanel }} from \"../components/PreviewPanel.jsx\";
+import {{ NotesPanel }} from \"../components/NotesPanel.jsx\";
 
 export function StudioPage() {{
+  const [draft, setDraft] = useState(\"Start writing here...\");
+
   return (
-    <div className="app-shell">
-      <div className="panel">
-        <div className="pill">Content studio</div>
+    <div className=\"app-shell\">
+      <div className=\"panel\">
+        <div className=\"pill\">Content studio</div>
         <h1>Content App</h1>
-        <p className="muted">{prompt}</p>
+        <p className=\"muted\">{prompt}</p>
       </div>
-
-      <div className="row two">
-        <EditorShell />
-        <PreviewPanel />
+      <div className=\"row two\">
+        <EditorShell value={{draft}} onChange={{setDraft}} />
+        <PreviewPanel value={{draft}} />
       </div>
-
       <NotesPanel />
     </div>
   );
@@ -705,29 +533,42 @@ export function StudioPage() {{
 
 
 def tool_page_code(prompt: str, battery_mode: bool) -> str:
-    extra = '<p className="muted">Battery-focused starter logic can be added next.</p>' if battery_mode else '<p className="muted">This is a clean generated tool starter.</p>'
+    extra = "Battery-focused starter logic can be added next." if battery_mode else "This is a clean generated tool starter."
     return f"""
-import React from "react";
-import {{ CalculatorForm }} from "../components/CalculatorForm.jsx";
-import {{ ResultsPanel }} from "../components/ResultsPanel.jsx";
-import {{ ExportActions }} from "../components/ExportActions.jsx";
+import React, {{ useEffect, useState }} from \"react\";
+import {{ CalculatorForm }} from \"../components/CalculatorForm.jsx\";
+import {{ ResultsPanel }} from \"../components/ResultsPanel.jsx\";
+import {{ ExportActions }} from \"../components/ExportActions.jsx\";
+import {{ getItems, createItem }} from \"../lib/api.js\";
 
 export function ToolPage() {{
+  const [items, setItems] = useState([]);
+  const [result, setResult] = useState(null);
+
+  useEffect(() => {{ getItems().then(setItems).catch(() => setItems([])); }}, []);
+
+  async function handleSave() {{
+    const created = await createItem({{ title: \"Generated result\", status: \"saved\", value: result || \"pending\" }});
+    setItems(prev => [created, ...prev]);
+  }}
+
   return (
-    <div className="app-shell">
-      <div className="panel">
-        <div className="pill">Tool workspace</div>
+    <div className=\"app-shell\">
+      <div className=\"panel\">
+        <div className=\"pill\">Tool workspace</div>
         <h1>Tool / Calculator</h1>
-        <p className="muted">{prompt}</p>
-        {extra}
+        <p className=\"muted\">{prompt}</p>
+        <p className=\"muted\">{extra}</p>
       </div>
-
-      <div className="row two">
-        <CalculatorForm />
-        <ResultsPanel />
+      <div className=\"row two\">
+        <CalculatorForm onCalculated={{setResult}} />
+        <ResultsPanel result={{result}} onSave={{handleSave}} />
       </div>
-
       <ExportActions />
+      <section className=\"panel\">
+        <h3>Saved results</h3>
+        <div className=\"list\">{{items.map(item => <div className=\"item\" key={{item.id}}><span>{{item.title}}</span><span className=\"muted\">{{item.status}}</span></div>)}}</div>
+      </section>
     </div>
   );
 }}
@@ -736,17 +577,17 @@ export function ToolPage() {{
 
 def sidebar_code() -> str:
     return """
-import React from "react";
+import React from \"react\";
 
 export function Sidebar() {
   return (
-    <aside className="panel">
+    <aside className=\"panel\">
       <h3>Navigation</h3>
-      <div className="card-grid">
-        <div className="card">Overview</div>
-        <div className="card">Customers</div>
-        <div className="card">Deals</div>
-        <div className="card">Reports</div>
+      <div className=\"card-grid\">
+        <div className=\"card\">Overview</div>
+        <div className=\"card\">Customers</div>
+        <div className=\"card\">Deals</div>
+        <div className=\"card\">Reports</div>
       </div>
     </aside>
   );
@@ -756,12 +597,12 @@ export function Sidebar() {
 
 def kpi_card_code() -> str:
     return """
-import React from "react";
+import React from \"react\";
 
 export function KpiCard({ title, value }) {
   return (
-    <div className="card">
-      <div className="pill">{title}</div>
+    <div className=\"card\">
+      <div className=\"pill\">{title}</div>
       <h3>{value}</h3>
     </div>
   );
@@ -771,13 +612,13 @@ export function KpiCard({ title, value }) {
 
 def inspector_code() -> str:
     return """
-import React from "react";
+import React from \"react\";
 
 export function InspectorPanel() {
   return (
-    <section className="panel">
+    <section className=\"panel\">
       <h3>Inspector</h3>
-      <p className="muted">Use this space for details, selected records, and quick controls.</p>
+      <p className=\"muted\">Use this space for details, selected records, and quick controls.</p>
     </section>
   );
 }
@@ -786,14 +627,15 @@ export function InspectorPanel() {
 
 def chat_shell_code() -> str:
     return """
-import React from "react";
+import React, { useState } from \"react\";
 
 export function ChatShell() {
+  const [message, setMessage] = useState(\"\");
   return (
-    <section className="panel">
+    <section className=\"panel\">
       <h3>Conversation</h3>
-      <div className="card">Assistant response area</div>
-      <input className="input" placeholder="Ask something..." />
+      <div className=\"card\">Assistant response area</div>
+      <input className=\"input\" value={message} onChange={(e) => setMessage(e.target.value)} placeholder=\"Ask something...\" />
     </section>
   );
 }
@@ -802,16 +644,16 @@ export function ChatShell() {
 
 def tool_rail_code() -> str:
     return """
-import React from "react";
+import React from \"react\";
 
 export function ToolRail() {
   return (
-    <aside className="panel">
+    <aside className=\"panel\">
       <h3>Tools</h3>
-      <div className="card-grid">
-        <div className="card">Search</div>
-        <div className="card">Actions</div>
-        <div className="card">History</div>
+      <div className=\"card-grid\">
+        <div className=\"card\">Search</div>
+        <div className=\"card\">Actions</div>
+        <div className=\"card\">History</div>
       </div>
     </aside>
   );
@@ -821,13 +663,13 @@ export function ToolRail() {
 
 def memory_panel_code() -> str:
     return """
-import React from "react";
+import React from \"react\";
 
 export function MemoryPanel() {
   return (
-    <section className="panel">
+    <section className=\"panel\">
       <h3>Memory</h3>
-      <p className="muted">Save notes, pinned answers, and reusable context here.</p>
+      <p className=\"muted\">Save notes, pinned answers, and reusable context here.</p>
     </section>
   );
 }
@@ -836,13 +678,13 @@ export function MemoryPanel() {
 
 def editor_shell_code() -> str:
     return """
-import React from "react";
+import React from \"react\";
 
-export function EditorShell() {
+export function EditorShell({ value, onChange }) {
   return (
-    <section className="panel">
+    <section className=\"panel\">
       <h3>Editor</h3>
-      <textarea className="input" rows={12} defaultValue="Start writing here..." />
+      <textarea className=\"input\" rows={12} value={value} onChange={(e) => onChange(e.target.value)} />
     </section>
   );
 }
@@ -851,13 +693,13 @@ export function EditorShell() {
 
 def preview_panel_code() -> str:
     return """
-import React from "react";
+import React from \"react\";
 
-export function PreviewPanel() {
+export function PreviewPanel({ value }) {
   return (
-    <section className="panel">
+    <section className=\"panel\">
       <h3>Preview</h3>
-      <div className="card">Live preview area</div>
+      <div className=\"card\">{value}</div>
     </section>
   );
 }
@@ -866,13 +708,13 @@ export function PreviewPanel() {
 
 def notes_panel_code() -> str:
     return """
-import React from "react";
+import React from \"react\";
 
 export function NotesPanel() {
   return (
-    <section className="panel">
+    <section className=\"panel\">
       <h3>Notes</h3>
-      <textarea className="input" rows={6} defaultValue="Draft notes..." />
+      <textarea className=\"input\" rows={6} defaultValue=\"Draft notes...\" />
     </section>
   );
 }
@@ -881,16 +723,24 @@ export function NotesPanel() {
 
 def calculator_form_code() -> str:
     return """
-import React from "react";
+import React, { useState } from \"react\";
 
-export function CalculatorForm() {
+export function CalculatorForm({ onCalculated }) {
+  const [a, setA] = useState(\"\");
+  const [b, setB] = useState(\"\");
+
+  function handleCalculate() {
+    const total = Number(a || 0) + Number(b || 0);
+    onCalculated?.(total);
+  }
+
   return (
-    <section className="panel">
+    <section className=\"panel\">
       <h3>Inputs</h3>
-      <div className="row">
-        <input className="input" placeholder="Value 1" />
-        <input className="input" placeholder="Value 2" />
-        <button className="primary-btn">Calculate</button>
+      <div className=\"row\">
+        <input className=\"input\" placeholder=\"Value 1\" value={a} onChange={(e) => setA(e.target.value)} />
+        <input className=\"input\" placeholder=\"Value 2\" value={b} onChange={(e) => setB(e.target.value)} />
+        <button className=\"primary-btn\" onClick={handleCalculate}>Calculate</button>
       </div>
     </section>
   );
@@ -900,13 +750,14 @@ export function CalculatorForm() {
 
 def results_panel_code() -> str:
     return """
-import React from "react";
+import React from \"react\";
 
-export function ResultsPanel() {
+export function ResultsPanel({ result, onSave }) {
   return (
-    <section className="panel">
+    <section className=\"panel\">
       <h3>Results</h3>
-      <div className="card">Calculated output will appear here.</div>
+      <div className=\"card\">{result === null ? \"Calculated output will appear here.\" : `Result: ${result}`}</div>
+      <button className=\"primary-btn\" onClick={onSave}>Save Result</button>
     </section>
   );
 }
@@ -915,15 +766,15 @@ export function ResultsPanel() {
 
 def export_actions_code() -> str:
     return """
-import React from "react";
+import React from \"react\";
 
 export function ExportActions() {
   return (
-    <section className="panel">
+    <section className=\"panel\">
       <h3>Export</h3>
-      <div className="row">
-        <button className="primary-btn">Export JSON</button>
-        <button className="primary-btn">Export PDF</button>
+      <div className=\"row\">
+        <button className=\"primary-btn\">Export JSON</button>
+        <button className=\"primary-btn\">Export PDF</button>
       </div>
     </section>
   );
@@ -933,98 +784,26 @@ export function ExportActions() {
 
 def login_page_code() -> str:
     return """
-import React from "react";
+import React, { useState } from \"react\";
+import { signIn } from \"../lib/auth.js\";
 
 export function LoginPage() {
+  const [email, setEmail] = useState(\"\");
+  const [password, setPassword] = useState(\"\");
+
+  function handleSubmit() {
+    signIn(email, password);
+  }
+
   return (
-    <div className="app-shell">
-      <section className="panel">
+    <div className=\"app-shell\">
+      <section className=\"panel\">
         <h1>Login</h1>
-        <div className="row">
-          <input className="input" placeholder="Email" />
-          <input className="input" placeholder="Password" type="password" />
-          <button className="primary-btn">Sign in</button>
+        <div className=\"row\">
+          <input className=\"input\" placeholder=\"Email\" value={email} onChange={(e) => setEmail(e.target.value)} />
+          <input className=\"input\" placeholder=\"Password\" type=\"password\" value={password} onChange={(e) => setPassword(e.target.value)} />
+          <button className=\"primary-btn\" onClick={handleSubmit}>Sign in</button>
         </div>
-      </section>
-    </div>
-  );
-}
-""".strip()
-
-
-def register_page_code() -> str:
-    return """
-import React from "react";
-
-export function RegisterPage() {
-  return (
-    <div className="app-shell">
-      <section className="panel">
-        <h1>Create account</h1>
-        <div className="row">
-          <input className="input" placeholder="Name" />
-          <input className="input" placeholder="Email" />
-          <input className="input" placeholder="Password" type="password" />
-          <button className="primary-btn">Create account</button>
-        </div>
-      </section>
-    </div>
-  );
-}
-""".strip()
-
-
-def settings_page_code() -> str:
-    return """
-import React from "react";
-
-export function SettingsPage() {
-  return (
-    <div className="app-shell">
-      <section className="panel">
-        <div className="pill">Settings</div>
-        <h1>Preferences</h1>
-        <p className="muted">Manage profile, appearance, and app defaults here.</p>
-      </section>
-    </div>
-  );
-}
-""".strip()
-
-
-def pricing_page_code() -> str:
-    return """
-import React from "react";
-
-export function PricingPage() {
-  return (
-    <div className="app-shell">
-      <section className="panel">
-        <div className="pill">Billing</div>
-        <h1>Plans</h1>
-        <div className="card-grid">
-          <div className="card"><h3>Starter</h3><p className="muted">$0</p></div>
-          <div className="card"><h3>Pro</h3><p className="muted">$19/mo</p></div>
-        </div>
-      </section>
-    </div>
-  );
-}
-""".strip()
-
-
-def scan_page_code() -> str:
-    return """
-import React from "react";
-
-export function ScanPage() {
-  return (
-    <div className="app-shell">
-      <section className="panel">
-        <div className="pill">AI Tools</div>
-        <h1>Scan / Diagnose</h1>
-        <input className="input" type="file" />
-        <div className="card" style={{ marginTop: 12 }}>Results and AI analysis will appear here.</div>
       </section>
     </div>
   );
@@ -1035,37 +814,13 @@ export function ScanPage() {
 def auth_code() -> str:
     return """
 export function signIn(email, password) {
-  return { ok: true, email, token: "demo-token" };
+  const token = `demo-token-${email || \"guest\"}`;
+  localStorage.setItem(\"builder_token\", token);
+  return { ok: true, email, token };
 }
 
-export function saveSession(session) {
-  localStorage.setItem("demo_session", JSON.stringify(session));
-}
-
-export function readSession() {
-  try {
-    return JSON.parse(localStorage.getItem("demo_session") || "null");
-  } catch {
-    return null;
-  }
-}
-""".strip()
-
-
-def storage_code() -> str:
-    return """
-const KEY = "builder_generated_items";
-
-export function readItems() {
-  try {
-    return JSON.parse(localStorage.getItem(KEY) || "[]");
-  } catch {
-    return [];
-  }
-}
-
-export function saveItems(items) {
-  localStorage.setItem(KEY, JSON.stringify(items || []));
+export function getToken() {
+  return localStorage.getItem(\"builder_token\") || \"\";
 }
 """.strip()
 
@@ -1084,282 +839,354 @@ export function estimateBatteryPlan(items = [], voltage = 12, autonomyDays = 1, 
 
 def appliance_table_code() -> str:
     return """
-import React from "react";
+import React from \"react\";
 
 export function ApplianceTable() {
   return (
-    <section className="panel">
+    <section className=\"panel\">
       <h3>Appliances</h3>
-      <div className="card">RV Fridge · Lights · Fan</div>
+      <div className=\"card\">RV Fridge · Lights · Fan</div>
     </section>
   );
 }
 """.strip()
 
 
-def package_json(app_type: str, systems: List[str]) -> str:
-    deps = {
-        "react": "^18.3.1",
-        "react-dom": "^18.3.1",
-    }
-    if systems:
-        deps["react-router-dom"] = "^6.26.1"
-    return json.dumps({
-        "name": "builder-generated-frontend",
-        "private": True,
-        "version": "0.0.1",
-        "type": "module",
-        "scripts": {
-            "dev": "vite",
-            "build": "vite build",
-            "preview": "vite preview"
-        },
-        "dependencies": deps,
-        "devDependencies": {
-            "vite": "^5.4.2"
-        }
-    }, indent=2)
-
-
-def vite_config_code() -> str:
+def api_client_code() -> str:
     return """
-import { defineConfig } from "vite";
-import react from "@vitejs/plugin-react";
+const API_BASE = import.meta.env.VITE_API_URL || \"http://localhost:8000\";
 
-export default defineConfig({
-  plugins: [react()],
-  server: {
-    port: 5173,
-    host: true
+async function request(path, options = {}) {
+  const response = await fetch(`${API_BASE}${path}`, {
+    headers: { \"Content-Type\": \"application/json\", ...(options.headers || {}) },
+    ...options,
+  });
+  if (!response.ok) {
+    throw new Error(`API error: ${response.status}`);
   }
-});
+  return response.json();
+}
+
+export async function getItems() {
+  return request(\"/api/items\");
+}
+
+export async function createItem(payload) {
+  return request(\"/api/items\", { method: \"POST\", body: JSON.stringify(payload) });
+}
+
+export async function updateItem(id, payload) {
+  return request(`/api/items/${id}`, { method: \"PUT\", body: JSON.stringify(payload) });
+}
+
+export async function deleteItem(id) {
+  return request(`/api/items/${id}`, { method: \"DELETE\" });
+}
 """.strip()
 
 
-def index_html_code() -> str:
+def use_items_hook_code() -> str:
     return """
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Builder Generated App</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.jsx"></script>
-  </body>
-</html>
+import { useEffect, useState } from \"react\";
+import { getItems, createItem, updateItem, deleteItem } from \"../lib/api.js\";
+
+export function useItems() {
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(\"\");
+
+  async function refresh() {
+    try {
+      setLoading(true);
+      setError(\"\");
+      const data = await getItems();
+      setItems(data);
+    } catch (err) {
+      setError(err.message || \"Failed to load items\");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function addItem(payload) {
+    const created = await createItem(payload);
+    setItems((prev) => [created, ...prev]);
+    return created;
+  }
+
+  async function saveItem(id, payload) {
+    const updated = await updateItem(id, payload);
+    setItems((prev) => prev.map((item) => item.id === id ? updated : item));
+    return updated;
+  }
+
+  async function removeItem(id) {
+    await deleteItem(id);
+    setItems((prev) => prev.filter((item) => item.id !== id));
+  }
+
+  useEffect(() => { refresh(); }, []);
+
+  return { items, loading, error, refresh, addItem, saveItem, removeItem };
+}
 """.strip()
 
 
-def frontend_gitignore() -> str:
-    return """
-node_modules
-dist
-.env
-""".strip()
+def backend_requirements_code(persistence: str) -> str:
+    base = ["fastapi", "uvicorn[standard]", "pydantic"]
+    if persistence == "sqlite":
+        base.append("sqlalchemy")
+    if persistence == "supabase":
+        base += ["supabase", "python-dotenv"]
+    return "\n".join(base)
 
 
-def backend_requirements(persistence_mode: str, systems: List[str]) -> str:
-    pkgs = ["fastapi", "uvicorn", "pydantic"]
-    if persistence_mode == "supabase":
-        pkgs.append("supabase")
-    return "\n".join(pkgs)
-
-
-def backend_env_example(persistence_mode: str) -> str:
-    lines = [
-        "PORT=8000",
-        "FRONTEND_ORIGIN=http://localhost:5173",
-    ]
-    if persistence_mode == "supabase":
-        lines += [
-            "SUPABASE_URL=your-project-url",
-            "SUPABASE_KEY=your-service-key",
-        ]
+def backend_env_example_code(persistence: str) -> str:
+    lines = ["PORT=8000"]
+    if persistence == "supabase":
+        lines += ["SUPABASE_URL=your_supabase_url", "SUPABASE_KEY=your_supabase_key"]
     return "\n".join(lines)
 
 
-def backend_main_stub(persistence_mode: str, systems: List[str]) -> str:
-    extra_imports = []
-    extra_routes = []
-    if "auth" in systems:
-        extra_imports.append("from routes.auth import router as auth_router")
-        extra_routes.append("app.include_router(auth_router, prefix='/api/auth', tags=['auth'])")
-    if "storage" in systems:
-        extra_imports.append("from routes.storage import router as storage_router")
-        extra_routes.append("app.include_router(storage_router, prefix='/api/storage', tags=['storage'])")
-    if "billing" in systems:
-        extra_imports.append("from routes.billing import router as billing_router")
-        extra_routes.append("app.include_router(billing_router, prefix='/api/billing', tags=['billing'])")
-    if "ai-tools" in systems:
-        extra_imports.append("from routes.ai_tools import router as ai_tools_router")
-        extra_routes.append("app.include_router(ai_tools_router, prefix='/api/ai-tools', tags=['ai-tools'])")
-
-    db_hint = ""
-    if persistence_mode == "sqlite":
-        db_hint = "\n# SQLite helper available in db.py\n"
-    elif persistence_mode == "supabase":
-        db_hint = "\n# Supabase helper available in supabase_client.py\n"
-
-    return f"""
-from fastapi import FastAPI
+def backend_api_code(persistence: str) -> str:
+    store_import = "from data_store import list_items, create_item, update_item, delete_item"
+    return f'''from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-{chr(10).join(extra_imports)}
+from pydantic import BaseModel, Field
+from typing import Any, Dict, List
+{store_import}
 
 app = FastAPI(title="Generated App Backend")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+class ItemPayload(BaseModel):
+    title: str = "Untitled"
+    status: str = "draft"
+    value: Any = None
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
 @app.get("/health")
 def health():
-    return {{"status": "ok"}}
-{db_hint}
-{chr(10).join(extra_routes)}
-""".strip()
+    return {{"status": "ok", "persistence": "{persistence}"}}
+
+@app.get("/api/items")
+def get_items():
+    return list_items()
+
+@app.post("/api/items")
+def post_item(payload: ItemPayload):
+    return create_item(payload.model_dump())
+
+@app.put("/api/items/{{item_id}}")
+def put_item(item_id: int, payload: ItemPayload):
+    updated = update_item(item_id, payload.model_dump())
+    if not updated:
+        raise HTTPException(status_code=404, detail="Item not found")
+    return updated
+
+@app.delete("/api/items/{{item_id}}")
+def remove_item(item_id: int):
+    deleted = delete_item(item_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Item not found")
+    return {{"ok": True, "id": item_id}}
+'''.strip()
 
 
-def route_auth_py() -> str:
-    return """
-from fastapi import APIRouter
-from pydantic import BaseModel
-
-router = APIRouter()
-
-class LoginPayload(BaseModel):
-    email: str
-    password: str
-
-@router.post("/login")
-def login(payload: LoginPayload):
-    return {"ok": True, "token": "demo-token", "email": payload.email}
-
-@router.post("/register")
-def register(payload: LoginPayload):
-    return {"ok": True, "message": "Account created", "email": payload.email}
-""".strip()
+def localstorage_backend_store_code() -> str:
+    return '''_ITEMS = [
+    {"id": 1, "title": "Sample item", "status": "ready", "value": 42, "meta": {}},
+    {"id": 2, "title": "Starter record", "status": "draft", "value": None, "meta": {}},
+]
 
 
-def route_storage_py(persistence_mode: str) -> str:
-    engine = "sqlite" if persistence_mode == "sqlite" else ("supabase" if persistence_mode == "supabase" else "localstorage-compatible")
-    return f"""
-from fastapi import APIRouter
-
-router = APIRouter()
-
-_ITEMS = []
-
-@router.get("/items")
 def list_items():
-    return {{"ok": True, "engine": "{engine}", "items": _ITEMS}}
-
-@router.post("/seed")
-def seed_items():
-    _ITEMS.clear()
-    _ITEMS.extend([
-        {{"id": 1, "title": "First item"}},
-        {{"id": 2, "title": "Second item"}}
-    ])
-    return {{"ok": True, "count": len(_ITEMS)}}
-""".strip()
+    return list(reversed(_ITEMS))
 
 
-def route_billing_py() -> str:
-    return """
-from fastapi import APIRouter
-
-router = APIRouter()
-
-@router.get("/plans")
-def plans():
-    return {
-        "ok": True,
-        "plans": [
-            {"id": "starter", "price": 0},
-            {"id": "pro", "price": 19}
-        ]
-    }
-""".strip()
+def create_item(payload):
+    new_id = max([item["id"] for item in _ITEMS], default=0) + 1
+    item = {"id": new_id, **payload}
+    _ITEMS.append(item)
+    return item
 
 
-def route_ai_tools_py() -> str:
-    return """
-from fastapi import APIRouter
-
-router = APIRouter()
-
-@router.post("/scan")
-def scan():
-    return {"ok": True, "message": "AI scan endpoint placeholder"}
-""".strip()
+def update_item(item_id, payload):
+    for index, item in enumerate(_ITEMS):
+        if item["id"] == item_id:
+            updated = {"id": item_id, **payload}
+            _ITEMS[index] = updated
+            return updated
+    return None
 
 
-def db_py() -> str:
-    return """
-import sqlite3
+def delete_item(item_id):
+    for index, item in enumerate(_ITEMS):
+        if item["id"] == item_id:
+            _ITEMS.pop(index)
+            return True
+    return False
+'''.strip()
+
+
+def sqlite_backend_store_code() -> str:
+    return '''import sqlite3
 from pathlib import Path
 
 DB_PATH = Path(__file__).with_name("app.db")
 
-def get_conn():
-    return sqlite3.connect(DB_PATH)
 
-def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL)")
+def _connect():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _init():
+    conn = _connect()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL,
+            value TEXT,
+            meta TEXT
+        )
+        """
+    )
     conn.commit()
     conn.close()
-""".strip()
 
 
-def supabase_client_py() -> str:
-    return """
-import os
+_init()
+
+
+def list_items():
+    conn = _connect()
+    rows = conn.execute("SELECT id, title, status, value, meta FROM items ORDER BY id DESC").fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def create_item(payload):
+    conn = _connect()
+    cursor = conn.execute(
+        "INSERT INTO items (title, status, value, meta) VALUES (?, ?, ?, ?)",
+        (payload.get("title", "Untitled"), payload.get("status", "draft"), str(payload.get("value")), json.dumps(payload.get("meta", {}))),
+    )
+    conn.commit()
+    item_id = cursor.lastrowid
+    conn.close()
+    return {"id": item_id, **payload}
+
+
+def update_item(item_id, payload):
+    conn = _connect()
+    cursor = conn.execute(
+        "UPDATE items SET title = ?, status = ?, value = ?, meta = ? WHERE id = ?",
+        (payload.get("title", "Untitled"), payload.get("status", "draft"), str(payload.get("value")), json.dumps(payload.get("meta", {})), item_id),
+    )
+    conn.commit()
+    conn.close()
+    if not cursor.rowcount:
+        return None
+    return {"id": item_id, **payload}
+
+
+def delete_item(item_id):
+    conn = _connect()
+    cursor = conn.execute("DELETE FROM items WHERE id = ?", (item_id,))
+    conn.commit()
+    conn.close()
+    return bool(cursor.rowcount)
+'''.strip()
+
+
+def supabase_backend_store_code() -> str:
+    return '''import os
+from supabase import create_client
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
-
-def get_supabase_config():
-    return {"url": SUPABASE_URL, "key_present": bool(SUPABASE_KEY)}
-""".strip()
+client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
 
-def supabase_schema_sql() -> str:
-    return """
-create table if not exists profiles (
-  id uuid primary key,
-  email text,
-  created_at timestamptz default now()
-);
+def list_items():
+    if not client:
+        return []
+    result = client.table("items").select("*").order("id", desc=True).execute()
+    return result.data or []
 
-create table if not exists records (
-  id bigint generated always as identity primary key,
+
+def create_item(payload):
+    if not client:
+        return {"id": 1, **payload}
+    result = client.table("items").insert(payload).execute()
+    return (result.data or [payload])[0]
+
+
+def update_item(item_id, payload):
+    if not client:
+        return {"id": item_id, **payload}
+    result = client.table("items").update(payload).eq("id", item_id).execute()
+    data = result.data or []
+    return data[0] if data else None
+
+
+def delete_item(item_id):
+    if not client:
+        return True
+    client.table("items").delete().eq("id", item_id).execute()
+    return True
+'''.strip()
+
+
+def supabase_schema_code() -> str:
+    return '''create table if not exists items (
+  id bigint generated by default as identity primary key,
   title text not null,
-  created_at timestamptz default now()
+  status text not null default 'draft',
+  value text,
+  meta jsonb default '{}'::jsonb
 );
-""".strip()
+'''.strip()
 
 
-def readme_md(project_name: str, app_type: str, builder_mode: str, systems: List[str], persistence_mode: str) -> str:
-    systems_text = ", ".join(systems) if systems else "none"
-    return f"""
-# {project_name}
+def package_json_code() -> str:
+    return json.dumps({
+        "name": "generated-builder-app",
+        "private": True,
+        "version": "0.0.1",
+        "type": "module",
+        "scripts": {"dev": "vite", "build": "vite build", "preview": "vite preview"},
+        "dependencies": {"react": "^18.3.1", "react-dom": "^18.3.1"},
+        "devDependencies": {"vite": "^5.4.10"},
+    }, indent=2)
 
-Generated with your AI Builder.
 
-## App profile
-- App type: {app_type}
-- Builder mode: {builder_mode}
-- Systems: {systems_text}
-- Persistence: {persistence_mode}
+def vite_env_example_code() -> str:
+    return "VITE_API_URL=http://localhost:8000\n"
+
+
+def readme_code(app_type: str, persistence: str, systems: List[str]) -> str:
+    return f'''# Generated App
+
+## App type
+{app_type}
+
+## Systems
+{", ".join(systems) if systems else "base"}
+
+## Persistence
+{persistence}
 
 ## Frontend
 ```bash
@@ -1372,79 +1199,23 @@ npm run dev
 ```bash
 cd backend
 pip install -r requirements.txt
-uvicorn main:app --reload
+uvicorn main:app --reload --port 8000
 ```
-""".strip()
+'''.strip()
 
 
-def build_system_files(systems: List[str], persistence_mode: str) -> List[Dict[str, Any]]:
-    files: List[Dict[str, Any]] = []
-    if "auth" in systems:
-        files += [
-            {"path": "frontend/src/pages/LoginPage.jsx", "language": "javascript", "content": login_page_code()},
-            {"path": "frontend/src/pages/RegisterPage.jsx", "language": "javascript", "content": register_page_code()},
-            {"path": "frontend/src/lib/auth.js", "language": "javascript", "content": auth_code()},
-            {"path": "backend/routes/auth.py", "language": "python", "content": route_auth_py()},
-        ]
-    if "storage" in systems:
-        files += [
-            {"path": "frontend/src/lib/storage.js", "language": "javascript", "content": storage_code()},
-            {"path": "backend/routes/storage.py", "language": "python", "content": route_storage_py(persistence_mode)},
-        ]
-    if "billing" in systems:
-        files += [
-            {"path": "frontend/src/pages/PricingPage.jsx", "language": "javascript", "content": pricing_page_code()},
-            {"path": "backend/routes/billing.py", "language": "python", "content": route_billing_py()},
-        ]
-    if "settings" in systems:
-        files += [
-            {"path": "frontend/src/pages/SettingsPage.jsx", "language": "javascript", "content": settings_page_code()},
-        ]
-    if "ai-tools" in systems:
-        files += [
-            {"path": "frontend/src/pages/ScanPage.jsx", "language": "javascript", "content": scan_page_code()},
-            {"path": "backend/routes/ai_tools.py", "language": "python", "content": route_ai_tools_py()},
-        ]
-    return files
-
-
-def build_persistence_files(persistence_mode: str, systems: List[str]) -> List[Dict[str, Any]]:
-    files: List[Dict[str, Any]] = [
-        {"path": "backend/requirements.txt", "language": "text", "content": backend_requirements(persistence_mode, systems)},
-        {"path": "backend/.env.example", "language": "text", "content": backend_env_example(persistence_mode)},
-    ]
-    if persistence_mode == "sqlite":
-        files.append({"path": "backend/db.py", "language": "python", "content": db_py()})
-    if persistence_mode == "supabase":
-        files += [
-            {"path": "backend/supabase_client.py", "language": "python", "content": supabase_client_py()},
-            {"path": "backend/supabase_schema.sql", "language": "sql", "content": supabase_schema_sql()},
-        ]
-    return files
-
-
-def base_frontend_support_files(project_name: str, app_type: str, builder_mode: str, systems: List[str], persistence_mode: str) -> List[Dict[str, Any]]:
-    return [
-        {"path": "frontend/package.json", "language": "json", "content": package_json(app_type, systems)},
-        {"path": "frontend/vite.config.js", "language": "javascript", "content": vite_config_code()},
-        {"path": "frontend/index.html", "language": "html", "content": index_html_code()},
-        {"path": "frontend/.gitignore", "language": "text", "content": frontend_gitignore()},
-        {"path": "README.md", "language": "markdown", "content": readme_md(project_name, app_type, builder_mode, systems, persistence_mode)},
-    ]
-
-
-def dedupe_files(files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    seen: Dict[str, Dict[str, Any]] = {}
-    for file in files:
-        seen[file["path"]] = file
-    return list(seen.values())
-
-
-def generate_code_bundle(prompt: str, app_type: str, builder_mode: str, style: str) -> List[Dict[str, Any]]:
+def generate_code_bundle(prompt: str, app_type: str, builder_mode: str, style: str, systems: List[str], persistence: str) -> List[Dict[str, Any]]:
     files = [
         {"path": "frontend/src/main.jsx", "language": "javascript", "content": main_jsx()},
-        {"path": "frontend/src/App.jsx", "language": "javascript", "content": root_app_code(app_type, prompt)},
+        {"path": "frontend/src/App.jsx", "language": "javascript", "content": root_app_code(app_type)},
         {"path": "frontend/src/styles/app.css", "language": "css", "content": app_css(style)},
+        {"path": "frontend/src/lib/api.js", "language": "javascript", "content": api_client_code()},
+        {"path": "frontend/package.json", "language": "json", "content": package_json_code()},
+        {"path": "frontend/.env.example", "language": "text", "content": vite_env_example_code()},
+        {"path": "backend/main.py", "language": "python", "content": backend_api_code(persistence)},
+        {"path": "backend/requirements.txt", "language": "text", "content": backend_requirements_code(persistence)},
+        {"path": "backend/.env.example", "language": "text", "content": backend_env_example_code(persistence)},
+        {"path": "README.md", "language": "markdown", "content": readme_code(app_type, persistence, systems)},
     ]
 
     if app_type == "admin panel":
@@ -1476,17 +1247,28 @@ def generate_code_bundle(prompt: str, app_type: str, builder_mode: str, style: s
             {"path": "frontend/src/components/ExportActions.jsx", "language": "javascript", "content": export_actions_code()},
         ]
 
-    if re.search(r"(auth|login|signin|sign in)", prompt.lower()):
+    if "auth" in systems:
         files += [
             {"path": "frontend/src/pages/LoginPage.jsx", "language": "javascript", "content": login_page_code()},
             {"path": "frontend/src/lib/auth.js", "language": "javascript", "content": auth_code()},
         ]
+
+    if "storage" in systems:
+        files.append({"path": "frontend/src/hooks/useItems.js", "language": "javascript", "content": use_items_hook_code()})
 
     if builder_mode == "battery-planner":
         files += [
             {"path": "frontend/src/lib/batteryMath.js", "language": "javascript", "content": battery_math_code()},
             {"path": "frontend/src/components/ApplianceTable.jsx", "language": "javascript", "content": appliance_table_code()},
         ]
+
+    if persistence == "sqlite":
+        files.append({"path": "backend/data_store.py", "language": "python", "content": sqlite_backend_store_code()})
+    elif persistence == "supabase":
+        files.append({"path": "backend/data_store.py", "language": "python", "content": supabase_backend_store_code()})
+        files.append({"path": "backend/supabase_schema.sql", "language": "sql", "content": supabase_schema_code()})
+    else:
+        files.append({"path": "backend/data_store.py", "language": "python", "content": localstorage_backend_store_code()})
 
     return files
 
@@ -1497,16 +1279,14 @@ def mutate(payload: MutateRequest):
     app_type = infer_app_type(prompt)
     builder_mode = infer_builder_mode(prompt)
     summary_style = infer_summary_style(prompt)
-    complexity = infer_complexity(prompt, payload.complexity)
-    systems = infer_systems(prompt, app_type, builder_mode, payload.systems)
-    persistence_mode = infer_persistence_mode(prompt, systems, complexity, payload.persistence_mode)
-    architecture = build_architecture(prompt, app_type, builder_mode, systems, complexity, persistence_mode, payload.architecture)
+    systems = payload.systems or infer_systems(prompt, app_type)
+    persistence = infer_persistence(prompt, systems, payload.complexity or "mvp")
     modules = recommend_modules(prompt, app_type)
     layout = build_layout(prompt, payload.current_layout)
-    file_tree = build_file_tree(app_type, builder_mode, prompt, systems, persistence_mode)
+    file_tree = build_file_tree(app_type, builder_mode, prompt, systems, persistence)
     routes = build_routes(app_type, prompt, systems)
-    components = build_components(app_type, prompt, systems)
-    summary = build_mutation_summary(layout, modules, app_type, builder_mode, systems, complexity, persistence_mode)
+    components = build_components(app_type, systems)
+    summary = build_mutation_summary(layout, modules, app_type, builder_mode, systems, persistence)
 
     return {
         "ok": True,
@@ -1514,10 +1294,8 @@ def mutate(payload: MutateRequest):
         "app_type": app_type,
         "builder_mode": builder_mode,
         "summary_style": summary_style,
-        "complexity": complexity,
         "systems": systems,
-        "persistence_mode": persistence_mode,
-        "architecture": architecture,
+        "persistence": persistence,
         "layout_changes": layout,
         "module_changes": {"enable": modules, "disable": []},
         "file_tree": file_tree,
@@ -1526,9 +1304,8 @@ def mutate(payload: MutateRequest):
         "mutation_summary": summary,
         "next_best_actions": [
             "materialize files",
+            "wire api data flow",
             "regenerate routes",
-            "add inspector",
-            "focus preview",
             "generate code",
         ],
     }
@@ -1539,41 +1316,35 @@ def generate_code(payload: GenerateCodeRequest):
     prompt = payload.prompt.strip()
     app_type = payload.app_type or infer_app_type(prompt)
     builder_mode = payload.builder_mode or infer_builder_mode(prompt)
+    systems = payload.systems or infer_systems(prompt, app_type)
     style = payload.style or "dark glass"
-    complexity = infer_complexity(prompt, payload.complexity)
-    systems = infer_systems(prompt, app_type, builder_mode, payload.systems)
-    persistence_mode = infer_persistence_mode(prompt, systems, complexity, payload.persistence_mode)
-    architecture = build_architecture(prompt, app_type, builder_mode, systems, complexity, persistence_mode, payload.architecture)
-    project_name = payload.project_name.strip() or slugify(prompt[:60], "builder-project")
+    complexity = payload.complexity or "mvp"
+    persistence = payload.persistence or infer_persistence(prompt, systems, complexity)
 
-    files = generate_code_bundle(prompt, app_type, builder_mode, style)
-    files += build_system_files(systems, persistence_mode)
-    files += build_persistence_files(persistence_mode, systems)
-    files += base_frontend_support_files(project_name, app_type, builder_mode, systems, persistence_mode)
-    if payload.include_backend:
-        files.append({"path": "backend/main.py", "language": "python", "content": backend_main_stub(persistence_mode, systems)})
-
-    files = dedupe_files(files)
-
+    files = generate_code_bundle(prompt, app_type, builder_mode, style, systems, persistence)
     routes = payload.routes or build_routes(app_type, prompt, systems)
-    components = payload.components or build_components(app_type, prompt, systems)
+    components = payload.components or build_components(app_type, systems)
 
     return {
         "ok": True,
         "prompt": prompt,
-        "project_name": project_name,
         "app_type": app_type,
         "builder_mode": builder_mode,
         "style": style,
-        "complexity": complexity,
         "systems": systems,
-        "persistence_mode": persistence_mode,
-        "architecture": architecture,
-        "generated_files": files,
+        "complexity": complexity,
+        "persistence": persistence,
         "files": files,
+        "generated_files": files,
         "routes": routes,
         "components": components,
         "entry_file": "frontend/src/main.jsx",
         "app_file": "frontend/src/App.jsx",
-        "summary": f"Generated {len(files)} files for a {app_type} in {builder_mode} mode with {persistence_mode} persistence.",
+        "backend_entry": "backend/main.py",
+        "data_flow": {
+            "frontend_client": "frontend/src/lib/api.js",
+            "backend_routes": ["GET /api/items", "POST /api/items", "PUT /api/items/{id}", "DELETE /api/items/{id}"],
+            "storage_file": "backend/data_store.py",
+        },
+        "summary": f"Generated {len(files)} files for a {app_type} in {builder_mode} mode with {persistence} persistence and live data flow.",
     }
