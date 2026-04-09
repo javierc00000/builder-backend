@@ -7,6 +7,9 @@ import re
 import json
 import time
 import uuid
+import shutil
+import tempfile
+from pathlib import Path
 
 app = FastAPI(title="Builder Backend v6 - Data Flow Generator")
 
@@ -1492,36 +1495,95 @@ def _build_preview_html(payload: PreviewRunRequest) -> str:
 </html>"""
 
 
-@app.post("/preview/run")
-def preview_run(payload: PreviewRunRequest):
-    session_id = payload.session_id or str(uuid.uuid4())
-    html = _build_preview_html(payload)
-    _PREVIEW_SESSIONS[session_id] = {
+
+def _preview_root() -> Path:
+    root = Path(tempfile.gettempdir()) / "builder_runtime_sandbox"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _safe_preview_relpath(raw_path: str) -> str:
+    value = str(raw_path or "").replace("\\", "/").lstrip("/")
+    parts = [part for part in value.split("/") if part not in {"", ".", ".."}]
+    return "/".join(parts) or "untitled.txt"
+
+
+def _session_dir(session_id: str) -> Path:
+    root = _preview_root() / session_id
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _write_preview_project(session_id: str, files: List[Dict[str, Any]]) -> Dict[str, Any]:
+    session_dir = _session_dir(session_id)
+    project_dir = session_dir / "project"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+    for index, file in enumerate(files):
+        rel_path = _safe_preview_relpath(file.get("path") or f"file-{index + 1}.txt")
+        target = project_dir / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        content = file.get("content")
+        target.write_text(content if isinstance(content, str) else str(content or ""), encoding="utf-8")
+        written.append({
+            "path": rel_path,
+            "size": len(content if isinstance(content, str) else str(content or "")),
+            "language": file.get("language") or "",
+        })
+    return {
+        "session_dir": str(session_dir),
+        "project_dir": str(project_dir),
+        "files": written,
+    }
+
+
+def _build_preview_manifest(payload: PreviewRunRequest, session_id: str, write_result: Dict[str, Any]) -> Dict[str, Any]:
+    return {
         "session_id": session_id,
         "project_id": payload.project_id,
-        "status": "ready",
+        "prompt": payload.prompt,
+        "app_type": payload.app_type,
+        "builder_mode": payload.builder_mode,
         "route": payload.route or "/",
         "auth_mode": payload.auth_mode or "guest",
+        "systems": payload.systems,
+        "routes": payload.routes,
+        "components": payload.components,
         "file_count": len(payload.files),
+        "files": write_result["files"],
+        "project_dir": write_result["project_dir"],
         "updated_at": int(time.time()),
-        "preview_html": html,
-    }
-    return {
-        "ok": True,
-        "session_id": session_id,
-        "status": "ready",
-        "route": payload.route or "/",
-        "auth_mode": payload.auth_mode or "guest",
-        "file_count": len(payload.files),
-        "preview_url": f"/preview/session/{session_id}",
+        "phase": "runtime-sandbox-phase-2",
     }
 
 
-@app.get("/preview/status/{session_id}")
-def preview_status(session_id: str):
-    session = _PREVIEW_SESSIONS.get(session_id)
-    if not session:
-        return {"ok": False, "status": "missing", "session_id": session_id}
+def _build_preview_logs(payload: PreviewRunRequest, manifest: Dict[str, Any]) -> List[str]:
+    files = manifest.get("files", [])
+    frontend_entry = next((item["path"] for item in files if item["path"].lower().endswith(("src/main.jsx", "src/main.js", "src/main.tsx", "src/main.ts"))), None)
+    backend_entry = next((item["path"] for item in files if item["path"].lower().endswith(("backend/main.py", "main.py", "app.py"))), None)
+    logs = [
+        "Phase 2 sandbox session prepared.",
+        f"Prompt: {payload.prompt or 'No prompt supplied'}",
+        f"Route boot: {payload.route or '/'}",
+        f"Auth mode: {payload.auth_mode or 'guest'}",
+        f"Files written: {len(payload.files)}",
+    ]
+    if frontend_entry:
+        logs.append(f"Detected frontend entry: {frontend_entry}")
+    if backend_entry:
+        logs.append(f"Detected backend entry: {backend_entry}")
+    logs.append("Runtime mode: local temp project prepared (no package install yet).")
+    logs.append("Next phase can swap this temp project into a true npm/dev server runner.")
+    return logs
+
+
+def _save_preview_artifacts(session_id: str, manifest: Dict[str, Any], logs: List[str]) -> None:
+    session_dir = _session_dir(session_id)
+    (session_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    (session_dir / "logs.json").write_text(json.dumps({"logs": logs}, indent=2), encoding="utf-8")
+
+
+def _session_payload(session_id: str, session: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "ok": True,
         "session_id": session_id,
@@ -1530,13 +1592,97 @@ def preview_status(session_id: str):
         "auth_mode": session.get("auth_mode", "guest"),
         "file_count": session.get("file_count", 0),
         "preview_url": f"/preview/session/{session_id}",
+        "manifest_url": f"/preview/manifest/{session_id}",
+        "files_url": f"/preview/files/{session_id}",
+        "logs_url": f"/preview/logs/{session_id}",
+        "project_dir": session.get("project_dir", ""),
         "updated_at": session.get("updated_at"),
+        "runtime_mode": session.get("runtime_mode", "prepared"),
+        "logs": session.get("logs", []),
+    }
+
+
+@app.post("/preview/run")
+def preview_run(payload: PreviewRunRequest):
+    session_id = payload.session_id or str(uuid.uuid4())
+    write_result = _write_preview_project(session_id, payload.files)
+    manifest = _build_preview_manifest(payload, session_id, write_result)
+    logs = _build_preview_logs(payload, manifest)
+    _save_preview_artifacts(session_id, manifest, logs)
+    html = _build_preview_html(payload)
+    _PREVIEW_SESSIONS[session_id] = {
+        "session_id": session_id,
+        "project_id": payload.project_id,
+        "status": "running",
+        "route": payload.route or "/",
+        "auth_mode": payload.auth_mode or "guest",
+        "file_count": len(payload.files),
+        "updated_at": int(time.time()),
+        "preview_html": html,
+        "project_dir": write_result["project_dir"],
+        "runtime_mode": "prepared-temp-project",
+        "manifest": manifest,
+        "logs": logs,
+    }
+    return _session_payload(session_id, _PREVIEW_SESSIONS[session_id])
+
+
+@app.post("/preview/reload/{session_id}")
+def preview_reload(session_id: str, payload: PreviewRunRequest):
+    payload.session_id = session_id
+    return preview_run(payload)
+
+
+@app.get("/preview/status/{session_id}")
+def preview_status(session_id: str):
+    session = _PREVIEW_SESSIONS.get(session_id)
+    if not session:
+        return {"ok": False, "status": "missing", "session_id": session_id}
+    return _session_payload(session_id, session)
+
+
+@app.get("/preview/manifest/{session_id}")
+def preview_manifest(session_id: str):
+    session = _PREVIEW_SESSIONS.get(session_id)
+    if not session:
+        return {"ok": False, "status": "missing", "session_id": session_id}
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "manifest": session.get("manifest", {}),
+    }
+
+
+@app.get("/preview/files/{session_id}")
+def preview_files(session_id: str):
+    session = _PREVIEW_SESSIONS.get(session_id)
+    if not session:
+        return {"ok": False, "status": "missing", "session_id": session_id}
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "project_dir": session.get("project_dir", ""),
+        "files": session.get("manifest", {}).get("files", []),
+    }
+
+
+@app.get("/preview/logs/{session_id}")
+def preview_logs(session_id: str):
+    session = _PREVIEW_SESSIONS.get(session_id)
+    if not session:
+        return {"ok": False, "status": "missing", "session_id": session_id}
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "logs": session.get("logs", []),
     }
 
 
 @app.post("/preview/reset")
 def preview_reset(payload: PreviewResetRequest):
     removed = _PREVIEW_SESSIONS.pop(payload.session_id, None)
+    if removed:
+        shutil.rmtree(_preview_root() / payload.session_id, ignore_errors=True)
     return {"ok": True, "removed": bool(removed), "session_id": payload.session_id}
 
 
