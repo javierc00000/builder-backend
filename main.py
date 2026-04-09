@@ -35,7 +35,14 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "service": "builder-backend-v6", "data_flow": True}
+    return {
+        "status": "healthy",
+        "service": "builder-backend-v6",
+        "data_flow": True,
+        "runtime_sandbox": True,
+        "preview_sessions": len(_PREVIEW_SESSIONS) if "_PREVIEW_SESSIONS" in globals() else 0,
+        "preview_root": os.getenv("BUILDER_PREVIEW_ROOT", "/tmp/builder_preview_sandbox"),
+    }
 
 
 class ApplianceItem(BaseModel):
@@ -1378,6 +1385,42 @@ class PreviewResetRequest(BaseModel):
 
 _PREVIEW_SESSIONS: Dict[str, Dict[str, Any]] = {}
 
+def _cleanup_preview_sessions(max_age_seconds: int = 3600 * 6, keep_latest: int = 20) -> None:
+    now_ts = int(time.time())
+    items = sorted(_PREVIEW_SESSIONS.items(), key=lambda item: item[1].get("updated_at", 0), reverse=True)
+    keep_ids = {session_id for session_id, _ in items[:keep_latest]}
+    for session_id, session in list(_PREVIEW_SESSIONS.items()):
+        age = now_ts - int(session.get("updated_at", now_ts))
+        if session_id in keep_ids and age < max_age_seconds:
+            continue
+        if age >= max_age_seconds or session_id not in keep_ids:
+            _PREVIEW_SESSIONS.pop(session_id, None)
+            shutil.rmtree(_preview_root() / session_id, ignore_errors=True)
+
+def _safe_session_id(raw_value: Optional[str]) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_-]", "", str(raw_value or ""))[:64]
+    return cleaned or str(uuid.uuid4())
+
+def _read_json_file(path: Path, fallback: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return fallback
+
+def _error_hint(errors: List[str], logs: List[str]) -> str:
+    joined = " ".join(errors + logs).lower()
+    if "npm install failed" in joined:
+        return "Dependency install failed. Try Recover sandbox to re-write the temp project and rebuild."
+    if "npm run build failed" in joined or "build failed" in joined:
+        return "Frontend build failed. Open logs to inspect the Vite/React error, then Recover sandbox after the fix."
+    if "package.json not found" in joined:
+        return "The generated files do not include a runnable frontend package yet. Regenerate code before rerunning the sandbox."
+    if "npm was not found" in joined:
+        return "The server runtime cannot run npm. The sandbox will stay in fallback preview mode until npm is available."
+    return "Use Recover sandbox first. If that fails, inspect logs and fall back to the in-browser preview."
+
 def _preview_root() -> Path:
     root = Path(os.getenv("BUILDER_PREVIEW_ROOT", "/tmp/builder_preview_sandbox"))
     root.mkdir(parents=True, exist_ok=True)
@@ -1495,6 +1538,22 @@ def _run_command(command: List[str], cwd: Path, timeout_seconds: int = 180) -> D
             "stderr": proc.stderr[-12000:],
             "command": " ".join(command),
         }
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "returncode": -2,
+            "stdout": (exc.stdout or "")[-12000:] if isinstance(exc.stdout, str) else "",
+            "stderr": (exc.stderr or "")[-12000:] if isinstance(exc.stderr, str) else f"Timed out after {timeout_seconds}s",
+            "command": " ".join(command),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "returncode": -1,
+            "stdout": "",
+            "stderr": str(exc),
+            "command": " ".join(command),
+        }
     except Exception as exc:
         return {
             "ok": False,
@@ -1525,9 +1584,11 @@ def _build_preview_manifest(payload: PreviewRunRequest, session_id: str, write_r
         "phase": "runtime-sandbox-phase-3",
     }
 
-def _execute_preview_runtime(session_id: str, payload: PreviewRunRequest, write_result: Dict[str, Any]) -> Dict[str, Any]:
+def _execute_preview_runtime(session_id: str, payload: PreviewRunRequest, write_result: Dict[str, Any], preserve_last_good: bool = True) -> Dict[str, Any]:
     project_dir = Path(write_result["project_dir"])
     frontend_root = _detect_frontend_root(project_dir)
+    session_dir = _session_dir(session_id)
+    last_good_dir = session_dir / "last_good_dist"
     npm_path = shutil.which("npm")
     logs = [
         "Phase 3 sandbox session prepared.",
@@ -1559,6 +1620,10 @@ def _execute_preview_runtime(session_id: str, payload: PreviewRunRequest, write_
     if not install_result["ok"]:
         errors.append("npm install failed")
         logs.append("npm install failed. Falling back to sandbox HTML shell.")
+        if preserve_last_good and last_good_dir.exists() and (last_good_dir / "index.html").exists():
+            runtime_mode = "recovered-last-good-build"
+            build_dir = str(last_good_dir)
+            logs.append("Recovered the previous successful static build for this sandbox session.")
         return {"runtime_mode": runtime_mode, "build_dir": build_dir, "logs": logs, "errors": errors}
 
     build_result = _run_command([npm_path, "run", "build"], frontend_root, timeout_seconds=240)
@@ -1570,13 +1635,21 @@ def _execute_preview_runtime(session_id: str, payload: PreviewRunRequest, write_
     if not build_result["ok"]:
         errors.append("npm run build failed")
         logs.append("Build failed. Falling back to sandbox HTML shell.")
+        if preserve_last_good and last_good_dir.exists() and (last_good_dir / "index.html").exists():
+            runtime_mode = "recovered-last-good-build"
+            build_dir = str(last_good_dir)
+            logs.append("Recovered the previous successful static build for this sandbox session.")
         return {"runtime_mode": runtime_mode, "build_dir": build_dir, "logs": logs, "errors": errors}
 
     dist_dir = frontend_root / "dist"
     if (dist_dir / "index.html").exists():
         runtime_mode = "built-static-preview"
         build_dir = str(dist_dir)
+        if last_good_dir.exists():
+            shutil.rmtree(last_good_dir, ignore_errors=True)
+        shutil.copytree(dist_dir, last_good_dir)
         logs.append("Static frontend build generated successfully. Serving sandbox dist bundle.")
+        logs.append("Saved this build as the last known good sandbox snapshot.")
     else:
         logs.append("Build completed but dist/index.html was not found. Falling back to sandbox HTML shell.")
     return {"runtime_mode": runtime_mode, "build_dir": build_dir, "logs": logs, "errors": errors}
@@ -1587,6 +1660,8 @@ def _save_preview_artifacts(session_id: str, manifest: Dict[str, Any], logs: Lis
     (session_dir / "logs.json").write_text(json.dumps({"logs": logs, "errors": errors}, indent=2), encoding="utf-8")
 
 def _session_payload(session_id: str, session: Dict[str, Any]) -> Dict[str, Any]:
+    errors = session.get("errors", [])
+    logs = session.get("logs", [])
     return {
         "ok": True,
         "session_id": session_id,
@@ -1603,12 +1678,15 @@ def _session_payload(session_id: str, session: Dict[str, Any]) -> Dict[str, Any]
         "updated_at": session.get("updated_at"),
         "runtime_mode": session.get("runtime_mode", "prepared"),
         "logs": session.get("logs", []),
-        "errors": session.get("errors", []),
+        "errors": errors,
+        "recovery_hint": session.get("recovery_hint") or _error_hint(errors, logs),
+        "recoverable": session.get("status") in {"fallback", "error", "degraded"},
     }
 
 @app.post("/preview/run")
 def preview_run(payload: PreviewRunRequest):
-    session_id = payload.session_id or str(uuid.uuid4())
+    _cleanup_preview_sessions()
+    session_id = _safe_session_id(payload.session_id)
     write_result = _write_preview_project(session_id, payload.files)
     runtime_result = _execute_preview_runtime(session_id, payload, write_result)
     manifest = _build_preview_manifest(payload, session_id, write_result, runtime_result["runtime_mode"], runtime_result["build_dir"])
@@ -1617,7 +1695,7 @@ def preview_run(payload: PreviewRunRequest):
     _PREVIEW_SESSIONS[session_id] = {
         "session_id": session_id,
         "project_id": payload.project_id,
-        "status": "ready" if runtime_result["runtime_mode"] == "built-static-preview" else "fallback",
+        "status": "ready" if runtime_result["runtime_mode"] == "built-static-preview" else ("degraded" if runtime_result["runtime_mode"] == "recovered-last-good-build" else "fallback"),
         "route": payload.route or "/",
         "auth_mode": payload.auth_mode or "guest",
         "file_count": len(payload.files),
@@ -1629,6 +1707,7 @@ def preview_run(payload: PreviewRunRequest):
         "manifest": manifest,
         "logs": runtime_result["logs"],
         "errors": runtime_result["errors"],
+        "recovery_hint": _error_hint(runtime_result["errors"], runtime_result["logs"]),
     }
     return _session_payload(session_id, _PREVIEW_SESSIONS[session_id])
 
@@ -1663,7 +1742,52 @@ def preview_logs(session_id: str):
     session = _PREVIEW_SESSIONS.get(session_id)
     if not session:
         return {"ok": False, "status": "missing", "session_id": session_id}
-    return {"ok": True, "session_id": session_id, "logs": session.get("logs", []), "errors": session.get("errors", [])}
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "logs": session.get("logs", []),
+        "errors": session.get("errors", []),
+        "recovery_hint": session.get("recovery_hint") or _error_hint(session.get("errors", []), session.get("logs", [])),
+    }
+
+@app.post("/preview/recover/{session_id}")
+def preview_recover(session_id: str):
+    session = _PREVIEW_SESSIONS.get(session_id)
+    if not session:
+        return {"ok": False, "status": "missing", "session_id": session_id}
+
+    manifest_path = _session_dir(session_id) / "manifest.json"
+    manifest = _read_json_file(manifest_path, session.get("manifest", {}))
+    files = []
+    for item in manifest.get("files", []):
+        rel_path = item.get("path")
+        if not rel_path:
+            continue
+        source = Path(session.get("project_dir", "")) / rel_path
+        try:
+            content = source.read_text(encoding="utf-8")
+        except Exception:
+            content = ""
+        files.append({
+            "path": rel_path,
+            "content": content,
+            "language": item.get("language") or "",
+        })
+
+    payload = PreviewRunRequest(
+        session_id=session_id,
+        project_id=session.get("project_id") or manifest.get("project_id"),
+        prompt=manifest.get("prompt") or "Recovered runtime sandbox",
+        app_type=manifest.get("app_type") or "",
+        builder_mode=manifest.get("builder_mode") or "",
+        route=session.get("route") or manifest.get("route") or "/",
+        auth_mode=session.get("auth_mode") or manifest.get("auth_mode") or "guest",
+        files=files,
+        routes=manifest.get("routes") or [],
+        components=manifest.get("components") or [],
+        systems=manifest.get("systems") or [],
+    )
+    return preview_run(payload)
 
 @app.post("/preview/reset")
 def preview_reset(payload: PreviewResetRequest):
