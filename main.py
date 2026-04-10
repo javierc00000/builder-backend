@@ -1018,11 +1018,31 @@ def find_relevant_knowledge(message: str, knowledge_items: List[Dict[str, str]],
     return [item for _, item in matches[:max_hits]]
 
 
-def build_project_advice(app_type: str, builder_mode: str, systems: List[str], decisions: Dict[str, Any], has_generated_app: bool) -> Dict[str, List[Dict[str, str]]]:
+def build_project_advice(
+    app_type: str,
+    builder_mode: str,
+    systems: List[str],
+    decisions: Dict[str, Any],
+    has_generated_app: bool,
+    message: str = "",
+    project_summary: str = "",
+) -> Dict[str, List[Dict[str, str]]]:
     upgrades: List[Dict[str, str]] = []
     cautions: List[Dict[str, str]] = []
     better_options: List[Dict[str, str]] = []
     is_calculator_tool = app_type == "tool app" and builder_mode == "battery-planner"
+    context_text = " ".join(part for part in [str(message or "").strip(), str(project_summary or "").strip()] if part).lower()
+    focus_count = sum(
+        1
+        for matched in [
+            re.search(r"(login|auth|account|sign in)", context_text),
+            re.search(r"(billing|subscription|pricing|paid|premium)", context_text),
+            re.search(r"(admin|dashboard|portal)", context_text),
+            re.search(r"(chat|assistant|ai)", context_text),
+            re.search(r"(marketplace|crm|inventory|community|team)", context_text),
+        ]
+        if matched
+    )
 
     if "auth" not in systems and app_type in {"admin panel", "assistant app"}:
         upgrades.append({"label": "Add login", "reason": "Protected workspaces usually need accounts, saved state, and project ownership."})
@@ -1030,6 +1050,10 @@ def build_project_advice(app_type: str, builder_mode: str, systems: List[str], d
         upgrades.append({"label": "Add paid tier", "reason": "Once users can save data, premium export, team features, or higher limits become realistic upgrades."})
     if builder_mode != "site-builder" and not is_calculator_tool and (has_generated_app or app_type in {"assistant app", "content app", "admin panel"}):
         upgrades.append({"label": "Add marketing page", "reason": "A strong landing page makes the project easier to explain, test, and ship."})
+    if has_generated_app and builder_mode != "site-builder" and not re.search(r"(mobile|responsive|tablet|phone)", context_text):
+        upgrades.append({"label": "Improve mobile flow", "reason": "Mobile polish is usually a high-value improvement once the first version exists."})
+    if is_calculator_tool:
+        upgrades.append({"label": "Add sample RV setups", "reason": "Sample scenarios help users understand the calculator faster before they enter custom numbers."})
 
     if decisions.get("billing_enabled") is True and decisions.get("auth_required") is False:
         cautions.append({"label": "Avoid paid flow without accounts", "reason": "Billing without login makes access recovery and entitlement checks messy."})
@@ -1037,6 +1061,14 @@ def build_project_advice(app_type: str, builder_mode: str, systems: List[str], d
         cautions.append({"label": "Do not overbuild v1", "reason": "Starting with a full dashboard before the core tool works can slow the first release."})
     if builder_mode == "site-builder" and "billing" in systems:
         cautions.append({"label": "Keep the site simple first", "reason": "Landing pages usually convert better before you add subscriptions, portals, or complex app state."})
+    if not has_generated_app and len(context_text.split()) < 10:
+        cautions.append({"label": "Idea is still too broad", "reason": "A short request can produce a generic first version, so one clear audience or main workflow would improve the build."})
+    if not has_generated_app and focus_count >= 3:
+        cautions.append({"label": "Too many first-version goals", "reason": "Trying to launch login, billing, admin, and AI together usually makes the first version slower and less clear."})
+    if has_generated_app and "storage" in systems and "auth" not in systems and app_type != "tool app":
+        cautions.append({"label": "Saved data may feel temporary", "reason": "If people can save work without accounts, they may lose trust when data is tied only to one browser."})
+    if is_calculator_tool and not re.search(r"(preset|sample|appliance|device)", context_text):
+        cautions.append({"label": "Too much manual input", "reason": "If every RV load must be typed from scratch, the calculator can feel harder than it should."})
 
     if (decisions.get("product_shape") == "tool" or is_calculator_tool) and "dashboard" in systems:
         better_options.append({"label": "Start with a single focused tool", "reason": "Ship one excellent calculator or workflow first, then add dashboard history later."})
@@ -1044,6 +1076,10 @@ def build_project_advice(app_type: str, builder_mode: str, systems: List[str], d
         better_options.append({"label": "Use guest mode first", "reason": "Let users try the assistant instantly, then add account save features after value is proven."})
     if "billing" not in systems and has_generated_app:
         better_options.append({"label": "Add premium exports instead of full subscriptions", "reason": "That is often a simpler first monetization step than a full billing system."})
+    if not has_generated_app and focus_count >= 3:
+        better_options.append({"label": "Pick one hero workflow", "reason": "A single core task makes the builder smarter because it can optimize one clear result instead of spreading across too many features."})
+    if is_calculator_tool:
+        better_options.append({"label": "Use presets first, advanced inputs second", "reason": "That keeps the calculator easy for most RV owners while still leaving room for deeper tuning later."})
 
     return {
         "upgrades": upgrades[:3],
@@ -1055,7 +1091,7 @@ def build_project_advice(app_type: str, builder_mode: str, systems: List[str], d
 def build_generation_project_memory(payload_prompt: str, project_memory: Dict[str, Any], app_type: str, builder_mode: str, systems: List[str], has_generated_app: bool) -> Dict[str, Any]:
     previous_memory = dict(project_memory or {})
     decisions = dict(previous_memory.get("decisions") or {})
-    advice = build_project_advice(app_type, builder_mode, systems, decisions, has_generated_app)
+    advice = build_project_advice(app_type, builder_mode, systems, decisions, has_generated_app, payload_prompt, payload_prompt)
     global_knowledge_count = len(load_global_knowledge_store())
     return {
         **previous_memory,
@@ -1301,12 +1337,12 @@ def merge_action_lists(*action_groups: List[Dict[str, str]], limit: int = 5) -> 
 def build_project_memory(payload: ChatAgentRequest, app_type: str, builder_mode: str, systems: List[str], has_generated_app: bool, questions: List[str], suggested_actions: List[Dict[str, str]], research: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     previous_memory = dict(payload.project_memory or {})
     decisions = infer_decisions_from_message(payload.message, previous_memory)
-    advice = build_project_advice(app_type, builder_mode, systems, decisions, has_generated_app)
+    project_summary = payload.current_prompt or previous_memory.get("project_summary") or payload.message
+    advice = build_project_advice(app_type, builder_mode, systems, decisions, has_generated_app, payload.message, project_summary)
     knowledge_items = update_knowledge_bank(previous_memory, research)
     global_knowledge_count = len(load_global_knowledge_store())
     latest_research = research or previous_memory.get("latest_research") or {}
     research_recommendation = build_research_recommendation(latest_research, has_generated_app, systems, app_type)
-    project_summary = payload.current_prompt or previous_memory.get("project_summary") or payload.message
     if len(payload.message.split()) > 3:
         project_summary = payload.message
     return {
