@@ -2,10 +2,19 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
+from datetime import datetime, timezone
 import re
 import json
+from pathlib import Path
+
+try:
+    from duckduckgo_search import DDGS
+except Exception:
+    DDGS = None
 
 app = FastAPI(title="Builder Backend v6 - Data Flow Generator")
+
+KNOWLEDGE_STORE_PATH = Path(__file__).with_name("builder_knowledge_store.json")
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,6 +39,24 @@ def health():
     return {"status": "healthy", "service": "builder-backend-v6", "data_flow": True, "rv_monetization": True}
 
 
+@app.get("/knowledge-store")
+def knowledge_store(limit: int = 12):
+    items = load_global_knowledge_store()
+    topics = []
+    seen_topics = set()
+    for item in items:
+        topic = str(item.get("topic") or "").strip()
+        if topic and topic not in seen_topics:
+            seen_topics.add(topic)
+            topics.append(topic)
+    return {
+        "ok": True,
+        "count": len(items),
+        "items": items[: max(1, min(limit, 50))],
+        "top_topics": topics[:8],
+    }
+
+
 class ApplianceItem(BaseModel):
     name: str = ""
     watts: float = 0
@@ -49,6 +76,7 @@ class MutateRequest(BaseModel):
     current_layout: Dict[str, Any] = Field(default_factory=dict)
     active_modules: List[str] = Field(default_factory=list)
     feature_state: Dict[str, Any] = Field(default_factory=dict)
+    project_memory: Dict[str, Any] = Field(default_factory=dict)
     systems: List[str] = Field(default_factory=list)
     complexity: str = ""
     architecture: Dict[str, Any] = Field(default_factory=dict)
@@ -64,10 +92,24 @@ class GenerateCodeRequest(BaseModel):
     systems: List[str] = Field(default_factory=list)
     complexity: str = "mvp"
     architecture: Dict[str, Any] = Field(default_factory=dict)
+    project_memory: Dict[str, Any] = Field(default_factory=dict)
     persistence: str = ""
     rv_template_key: str = "rv_power"
     rv_camping_profile: str = "weekend"
     monetization_config: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ChatAgentRequest(BaseModel):
+    message: str
+    project_id: str = ""
+    current_prompt: str = ""
+    project_memory: Dict[str, Any] = Field(default_factory=dict)
+    feature_state: Dict[str, Any] = Field(default_factory=dict)
+    generated_files: List[Dict[str, Any]] = Field(default_factory=list)
+    routes: List[Dict[str, Any]] = Field(default_factory=list)
+    components: List[Dict[str, Any]] = Field(default_factory=list)
+    system_planner: Dict[str, Any] = Field(default_factory=dict)
+    chat_mode: str = "evolve"
 
 class RvMonetizationRequest(BaseModel):
     template_key: str = "rv_power"
@@ -281,6 +323,775 @@ def infer_summary_style(prompt: str) -> str:
     if re.search(r"(simple|quick|fast|short)", p):
         return "concise"
     return "balanced"
+
+
+def normalize_chat_mode(mode: str, has_generated_app: bool) -> str:
+    if mode == "mutate" and has_generated_app:
+        return "mutate"
+    return "evolve"
+
+
+def is_suggestion_request(message: str) -> bool:
+    return bool(re.search(r"(suggest|recommend|idea|ideas|what should|what can|help me choose|best option)", message))
+
+
+def is_explanation_request(message: str) -> bool:
+    return bool(re.search(r"(why|how does|how do|what is|explain|walk me through|show me what)", message))
+
+
+def is_mutation_request(message: str) -> bool:
+    return bool(re.search(r"(add|remove|change|update|edit|fix|improve|make it|turn it into|refactor|polish|redesign)", message))
+
+
+def needs_research(message: str) -> bool:
+    return bool(re.search(r"(research|search|look up|find information|find info|documentation|docs|latest|compare|comparison|best library|best package|which library|which package|sdk|integration guide|api docs)", message))
+
+
+def is_affirmative(message: str) -> bool:
+    return bool(re.fullmatch(r"\s*(yes|yeah|yep|sure|ok|okay|do it|sounds good|please do)\s*", message))
+
+
+def is_negative(message: str) -> bool:
+    return bool(re.fullmatch(r"\s*(no|nope|nah|not now|skip it|dont|don't)\s*", message))
+
+
+def infer_decisions_from_message(message: str, previous_memory: Dict[str, Any]) -> Dict[str, Any]:
+    lowered = message.lower().strip()
+    decisions = dict(previous_memory.get("decisions") or {})
+    unresolved_questions = list(previous_memory.get("unresolved_questions") or [])
+
+    if re.search(r"(login|auth|account|sign in|signin|user account|protected)", lowered):
+        decisions["auth_required"] = True
+    elif re.search(r"(public|open to everyone|no login|without login|guest only)", lowered):
+        decisions["auth_required"] = False
+
+    if re.search(r"(billing|subscription|stripe|paid plan|premium|checkout)", lowered):
+        decisions["billing_enabled"] = True
+    elif re.search(r"(free only|no billing|without billing|no payments|dont charge|don't charge)", lowered):
+        decisions["billing_enabled"] = False
+
+    if re.search(r"(dashboard|admin|portal|crm|saas)", lowered):
+        decisions["product_shape"] = "dashboard"
+    elif re.search(r"(landing page|marketing page|homepage)", lowered):
+        decisions["product_shape"] = "landing"
+    elif re.search(r"(tool|calculator|estimator)", lowered):
+        decisions["product_shape"] = "tool"
+    elif re.search(r"(assistant|chat app|copilot|agent)", lowered):
+        decisions["product_shape"] = "assistant"
+
+    if unresolved_questions and (is_affirmative(lowered) or is_negative(lowered)):
+        current_question = unresolved_questions[0].lower()
+        answer_value = is_affirmative(lowered)
+        if "sign in" in current_question or "open to everyone" in current_question:
+            decisions["auth_required"] = answer_value
+        elif "payments" in current_question or "subscriptions" in current_question:
+            decisions["billing_enabled"] = answer_value
+        elif "simple tool" in current_question or "saas-style" in current_question:
+            decisions["product_shape"] = "tool" if answer_value else decisions.get("product_shape", "dashboard")
+
+    return decisions
+
+
+def apply_decisions_to_systems(systems: List[str], decisions: Dict[str, Any]) -> List[str]:
+    resolved = set(systems)
+    if decisions.get("auth_required") is True:
+        resolved.add("auth")
+    if decisions.get("auth_required") is False and "auth" in resolved:
+        resolved.discard("auth")
+    if decisions.get("billing_enabled") is True:
+        resolved.add("billing")
+    if decisions.get("billing_enabled") is False and "billing" in resolved:
+        resolved.discard("billing")
+    shape = decisions.get("product_shape")
+    if shape == "dashboard":
+        resolved.add("dashboard")
+    if shape == "assistant":
+        resolved.add("ai-tools")
+    return sorted(resolved)
+
+
+def apply_decisions_to_product(app_type: str, builder_mode: str, decisions: Dict[str, Any]) -> tuple[str, str]:
+    shape = decisions.get("product_shape")
+    next_app_type = app_type
+    next_builder_mode = builder_mode
+    if shape == "dashboard":
+        next_app_type = "admin panel"
+        next_builder_mode = "dashboard-builder"
+    elif shape == "assistant":
+        next_app_type = "assistant app"
+        next_builder_mode = "general-builder"
+    elif shape == "landing":
+        next_app_type = "tool app"
+        next_builder_mode = "site-builder"
+    elif shape == "tool":
+        next_app_type = "tool app"
+        if next_builder_mode == "dashboard-builder":
+            next_builder_mode = "general-builder"
+    return next_app_type, next_builder_mode
+
+
+def build_research_query(message: str, app_type: str, builder_mode: str) -> str:
+    parts = [message.strip()]
+    if app_type:
+        parts.append(app_type)
+    if builder_mode:
+        parts.append(builder_mode)
+    parts.append("web app development best practices")
+    return " ".join(part for part in parts if part)
+
+
+def run_research(query: str, max_results: int = 5) -> Dict[str, Any]:
+    if not DDGS:
+        return {
+            "available": False,
+            "query": query,
+            "findings": [],
+            "error": "Web research is unavailable until duckduckgo-search is installed on the backend.",
+        }
+
+    try:
+        findings: List[Dict[str, str]] = []
+        with DDGS() as ddgs:
+            for item in ddgs.text(query, max_results=max_results):
+                findings.append({
+                    "title": item.get("title") or "Untitled result",
+                    "url": item.get("href") or "",
+                    "snippet": item.get("body") or "",
+                })
+        return {
+            "available": True,
+            "query": query,
+            "findings": findings,
+            "error": "",
+        }
+    except Exception as error:
+        return {
+            "available": False,
+            "query": query,
+            "findings": [],
+            "error": str(error),
+        }
+
+
+def summarize_research(research: Dict[str, Any], app_type: str, builder_mode: str) -> str:
+    findings = research.get("findings") or []
+    if findings:
+        top_titles = ", ".join(item.get("title", "source") for item in findings[:3])
+        return (
+            f"I researched that for a {app_type} in {builder_mode} mode. "
+            f"Top references point to: {top_titles}. "
+            "Use the findings below to choose the path you want, then I can apply it."
+        )
+    return (
+        "I tried to research that, but the backend could not fetch external results right now. "
+        f"Reason: {research.get('error') or 'unknown research error'}."
+    )
+
+
+def infer_research_focus(text: str) -> str:
+    lowered = text.lower()
+    focus_patterns = [
+        ("auth", r"(auth|login|sign in|signin|oauth|session|clerk|nextauth|authjs|supabase auth|firebase auth)"),
+        ("billing", r"(billing|stripe|subscription|checkout|payments|pricing|paywall)"),
+        ("database", r"(database|db|storage|supabase|postgres|sqlite|persistence|saved data)"),
+        ("ai", r"(ai|assistant|chat|llm|openai|anthropic|rag|embedding|tool calling)"),
+        ("mobile", r"(mobile|responsive|tablet|touch)"),
+        ("ui", r"(ui|design|layout|navigation|sidebar|dashboard)"),
+        ("deployment", r"(deploy|deployment|hosting|render|vercel|cloudflare|docker)"),
+    ]
+    for label, pattern in focus_patterns:
+        if re.search(pattern, lowered):
+            return label
+    return "general"
+
+
+def build_research_recommendation(research: Optional[Dict[str, Any]], has_generated_app: bool, systems: List[str], app_type: str) -> Dict[str, str]:
+    if not research or not research.get("findings"):
+        return {}
+
+    query = str(research.get("query") or "this topic").strip()
+    findings = list(research.get("findings") or [])
+    top_titles = [str(item.get("title") or "").strip() for item in findings[:2] if item.get("title")]
+    source_line = ", ".join(top_titles) if top_titles else "the saved research"
+    combined_text = " ".join(
+        [
+            query,
+            *top_titles,
+            *[str(item.get("snippet") or "") for item in findings[:3]],
+        ]
+    )
+    focus = infer_research_focus(combined_text)
+    system_line = ", ".join(systems[:3]) if systems else "core project systems"
+
+    if focus == "auth":
+        prompt = "Add authentication using the strongest researched approach, with protected routes, account state, and a simple sign-in flow. Keep the implementation practical for this project."
+        label = "Apply researched auth"
+        rationale_points = [
+            "The research focus is authentication, so the next change should be login and access control rather than unrelated UI work.",
+            f"This project already points toward {system_line}, which benefits from a clear account boundary.",
+            f"The strongest matching sources were {source_line}, so I am using that direction instead of guessing.",
+        ]
+    elif focus == "billing":
+        prompt = "Add billing using the strongest researched approach, including pricing, checkout entry points, and clear paid-tier wiring for this project."
+        label = "Apply researched billing"
+        rationale_points = [
+            "The research focus is billing, so the recommendation targets pricing and checkout flow directly.",
+            f"This project already depends on {system_line}, so billing should connect to the current product structure rather than be added as an isolated screen.",
+            f"The strongest matching sources were {source_line}, which gives the recommendation a concrete base.",
+        ]
+    elif focus == "database":
+        prompt = "Add persistent storage using the strongest researched approach, with practical schema choices, saved data flow, and project-safe defaults."
+        label = "Apply researched storage"
+        rationale_points = [
+            "The research focus is storage, so persistence is the highest-value next step.",
+            f"This project already uses or plans {system_line}, which makes saved data more useful than another surface-level feature.",
+            f"The recommendation is anchored in {source_line} rather than a generic stack guess.",
+        ]
+    elif focus == "ai":
+        prompt = "Add the researched AI implementation approach, including chat flow, tool integration, and the simplest production-ready structure for this project."
+        label = "Apply researched AI"
+        rationale_points = [
+            "The research focus is AI implementation, so the recommendation prioritizes chat flow and tool wiring.",
+            f"That fits the current project direction around {system_line} better than a broad rewrite.",
+            f"The strongest matching sources were {source_line}, so the choice is evidence-backed.",
+        ]
+    elif focus == "mobile":
+        prompt = "Improve this project for mobile using the strongest researched responsive approach, focusing on layout, navigation, spacing, and touch-friendly controls."
+        label = "Apply researched mobile improvements"
+        rationale_points = [
+            "The research focus is mobile usability, so the recommendation targets layout and navigation instead of adding new business logic.",
+            f"That is a practical improvement for the current systems: {system_line}.",
+            f"The choice is based on {source_line}, not a generic responsive checklist.",
+        ]
+    elif focus == "ui":
+        prompt = "Refine the interface using the strongest researched UI approach, improving navigation, readability, layout hierarchy, and user flow without overbuilding it."
+        label = "Apply researched UI"
+        rationale_points = [
+            "The research focus is interface quality, so the recommendation targets readability and navigation first.",
+            f"That supports the current system mix of {system_line} without forcing a product-direction change.",
+            f"The recommendation follows {source_line}, which gives it a stronger basis than personal taste alone.",
+        ]
+    elif focus == "deployment":
+        prompt = "Prepare this project using the strongest researched deployment approach, including environment setup, hosting assumptions, and production-safe project structure."
+        label = "Apply researched deployment plan"
+        rationale_points = [
+            "The research focus is deployment, so the recommendation targets hosting and production setup directly.",
+            f"That is a better next move for the current project systems: {system_line}.",
+            f"The choice is grounded in {source_line}, which reduces blind deployment decisions.",
+        ]
+    else:
+        if has_generated_app:
+            prompt = f"Use the strongest option from the saved research about {query} and apply it to the current project in a practical way."
+            label = "Apply researched recommendation"
+        else:
+            prompt = f"Build the first version of this project using the strongest option from the saved research about {query}, keeping the result focused and practical."
+            label = "Build from researched recommendation"
+        rationale_points = [
+            f"The research topic is {query}, so I am using that as the basis for the next change.",
+            f"The current project shape around {system_line} makes this recommendation more relevant than a generic starter template.",
+            f"The strongest matching sources were {source_line}, so the recommendation is tied to saved evidence.",
+        ]
+
+    mode = "mutate" if has_generated_app else "evolve"
+    explanation = " ".join(rationale_points)
+    return {
+        "label": label,
+        "prompt": prompt,
+        "mode": mode,
+        "reason": f"Based on {source_line}.",
+        "explanation": explanation,
+        "query": query,
+        "focus": focus,
+    }
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def knowledge_key(item: Dict[str, Any]) -> str:
+    return str(item.get("url") or item.get("title") or item.get("summary") or item.get("topic") or "").strip().lower()
+
+
+def compute_knowledge_score(item: Dict[str, Any]) -> float:
+    source_count = max(int(item.get("source_count") or 1), 1)
+    use_count = max(int(item.get("use_count") or 0), 0)
+    summary = str(item.get("summary") or "")
+    topic = str(item.get("topic") or "")
+    url = str(item.get("url") or "")
+    score = 12 + min(source_count, 8) * 8 + min(use_count, 12) * 5
+    if url:
+        score += 4
+    if topic:
+        score += 2
+    if len(summary) >= 120:
+        score += 4
+    elif summary:
+        score += 2
+    return round(float(score), 1)
+
+
+def normalize_knowledge_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = {
+        "topic": str(item.get("topic") or "research").strip(),
+        "title": str(item.get("title") or "Untitled result").strip(),
+        "url": str(item.get("url") or "").strip(),
+        "summary": str(item.get("summary") or "").strip(),
+        "source_count": max(int(item.get("source_count") or 1), 1),
+        "use_count": max(int(item.get("use_count") or 0), 0),
+        "learned_at": str(item.get("learned_at") or utc_now_iso()),
+        "updated_at": str(item.get("updated_at") or item.get("learned_at") or utc_now_iso()),
+    }
+    normalized["score"] = compute_knowledge_score(normalized)
+    return normalized
+
+
+def combine_knowledge_item(existing: Dict[str, Any], new_item: Dict[str, Any]) -> Dict[str, Any]:
+    existing_normalized = normalize_knowledge_item(existing)
+    new_normalized = normalize_knowledge_item(new_item)
+    topic_parts: List[str] = []
+    for topic in [existing_normalized.get("topic"), new_normalized.get("topic")]:
+        cleaned = str(topic or "").strip()
+        if cleaned and cleaned not in topic_parts:
+            topic_parts.append(cleaned)
+    combined = {
+        "topic": " | ".join(topic_parts[:3]) or "research",
+        "title": new_normalized.get("title") or existing_normalized.get("title") or "Untitled result",
+        "url": new_normalized.get("url") or existing_normalized.get("url") or "",
+        "summary": max(
+            [existing_normalized.get("summary") or "", new_normalized.get("summary") or ""],
+            key=len,
+        ),
+        "source_count": max(int(existing_normalized.get("source_count") or 1), 1) + max(int(new_normalized.get("source_count") or 1), 1),
+        "use_count": max(int(existing_normalized.get("use_count") or 0), 0) + max(int(new_normalized.get("use_count") or 0), 0),
+        "learned_at": existing_normalized.get("learned_at") or new_normalized.get("learned_at") or utc_now_iso(),
+        "updated_at": utc_now_iso(),
+    }
+    combined["score"] = compute_knowledge_score(combined)
+    return combined
+
+
+def sort_knowledge_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    normalized_items = [normalize_knowledge_item(item) for item in items if knowledge_key(item)]
+    return sorted(
+        normalized_items,
+        key=lambda item: (
+            float(item.get("score") or 0),
+            int(item.get("use_count") or 0),
+            int(item.get("source_count") or 0),
+            str(item.get("updated_at") or ""),
+        ),
+        reverse=True,
+    )
+
+
+def load_global_knowledge_store() -> List[Dict[str, str]]:
+    try:
+        if not KNOWLEDGE_STORE_PATH.exists():
+            return []
+        data = json.loads(KNOWLEDGE_STORE_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, list):
+            return []
+        return sort_knowledge_items(data)
+    except Exception:
+        return []
+
+
+def save_global_knowledge_store(items: List[Dict[str, str]]) -> None:
+    try:
+        KNOWLEDGE_STORE_PATH.write_text(json.dumps(sort_knowledge_items(items), indent=2), encoding="utf-8")
+    except Exception:
+        return
+
+
+def merge_knowledge_items(existing: List[Dict[str, str]], additions: List[Dict[str, str]], max_items: int) -> List[Dict[str, str]]:
+    by_key: Dict[str, Dict[str, Any]] = {}
+    for item in existing:
+        normalized = normalize_knowledge_item(item)
+        key = knowledge_key(normalized)
+        if key:
+            by_key[key] = normalized
+    for item in additions:
+        normalized = normalize_knowledge_item(item)
+        key = knowledge_key(normalized)
+        if not key:
+            continue
+        if key in by_key:
+            by_key[key] = combine_knowledge_item(by_key[key], normalized)
+        else:
+            by_key[key] = normalized
+    return sort_knowledge_items(list(by_key.values()))[:max_items]
+
+
+def mark_knowledge_usage(items: List[Dict[str, str]], hits: List[Dict[str, str]], increment: int = 1) -> List[Dict[str, str]]:
+    hit_keys = {knowledge_key(item) for item in hits if knowledge_key(item)}
+    if not hit_keys:
+        return sort_knowledge_items(items)
+    updated: List[Dict[str, Any]] = []
+    now = utc_now_iso()
+    for item in items:
+        normalized = normalize_knowledge_item(item)
+        if knowledge_key(normalized) in hit_keys:
+            normalized["use_count"] = max(int(normalized.get("use_count") or 0), 0) + increment
+            normalized["updated_at"] = now
+            normalized["score"] = compute_knowledge_score(normalized)
+        updated.append(normalized)
+    return sort_knowledge_items(updated)
+
+
+def research_findings_to_knowledge(research: Optional[Dict[str, Any]]) -> List[Dict[str, str]]:
+    if not research or not research.get("findings"):
+        return []
+    return [
+        {
+            "topic": research.get("query") or "research",
+            "title": item.get("title") or "Untitled result",
+            "url": item.get("url") or "",
+            "summary": item.get("snippet") or "",
+            "source_count": 1,
+            "use_count": 0,
+            "learned_at": utc_now_iso(),
+            "updated_at": utc_now_iso(),
+        }
+        for item in (research.get("findings") or [])
+    ]
+
+
+def update_knowledge_bank(previous_memory: Dict[str, Any], research: Optional[Dict[str, Any]], max_items: int = 18) -> List[Dict[str, str]]:
+    existing = list(previous_memory.get("knowledge_items") or [])
+    if not research or not research.get("findings"):
+        return existing[:max_items]
+    return merge_knowledge_items(existing, research_findings_to_knowledge(research), max_items)
+
+
+def find_relevant_knowledge(message: str, knowledge_items: List[Dict[str, str]], max_hits: int = 3) -> List[Dict[str, str]]:
+    tokens = [token for token in re.findall(r"[a-z0-9_\-]+", message.lower()) if len(token) > 2]
+    if not tokens:
+        return []
+
+    matches: List[tuple[float, Dict[str, str]]] = []
+    for item in knowledge_items:
+        normalized = normalize_knowledge_item(item)
+        haystack = " ".join([
+            str(normalized.get("topic") or "").lower(),
+            str(normalized.get("title") or "").lower(),
+            str(normalized.get("summary") or "").lower(),
+        ])
+        overlap = sum(1 for token in set(tokens) if token in haystack)
+        if overlap:
+            relevance = overlap * 10 + float(normalized.get("score") or 0)
+            matches.append((relevance, normalized))
+    matches.sort(key=lambda entry: entry[0], reverse=True)
+    return [item for _, item in matches[:max_hits]]
+
+
+def build_project_advice(app_type: str, builder_mode: str, systems: List[str], decisions: Dict[str, Any], has_generated_app: bool) -> Dict[str, List[Dict[str, str]]]:
+    upgrades: List[Dict[str, str]] = []
+    cautions: List[Dict[str, str]] = []
+    better_options: List[Dict[str, str]] = []
+
+    if "auth" not in systems and app_type in {"admin panel", "assistant app"}:
+        upgrades.append({"label": "Add login", "reason": "Protected workspaces usually need accounts, saved state, and project ownership."})
+    if "storage" in systems and "billing" not in systems and has_generated_app:
+        upgrades.append({"label": "Add paid tier", "reason": "Once users can save data, premium export, team features, or higher limits become realistic upgrades."})
+    if builder_mode != "site-builder":
+        upgrades.append({"label": "Add marketing page", "reason": "A strong landing page makes the project easier to explain, test, and ship."})
+
+    if decisions.get("billing_enabled") is True and decisions.get("auth_required") is False:
+        cautions.append({"label": "Avoid paid flow without accounts", "reason": "Billing without login makes access recovery and entitlement checks messy."})
+    if app_type == "tool app" and "dashboard" in systems and not has_generated_app:
+        cautions.append({"label": "Do not overbuild v1", "reason": "Starting with a full dashboard before the core tool works can slow the first release."})
+    if builder_mode == "site-builder" and "billing" in systems:
+        cautions.append({"label": "Keep the site simple first", "reason": "Landing pages usually convert better before you add subscriptions, portals, or complex app state."})
+
+    if decisions.get("product_shape") == "tool" and "dashboard" in systems:
+        better_options.append({"label": "Start with a single focused tool", "reason": "Ship one excellent calculator or workflow first, then add dashboard history later."})
+    if decisions.get("auth_required") is False and app_type == "assistant app":
+        better_options.append({"label": "Use guest mode first", "reason": "Let users try the assistant instantly, then add account save features after value is proven."})
+    if "billing" not in systems and has_generated_app:
+        better_options.append({"label": "Add premium exports instead of full subscriptions", "reason": "That is often a simpler first monetization step than a full billing system."})
+
+    return {
+        "upgrades": upgrades[:3],
+        "cautions": cautions[:3],
+        "better_options": better_options[:3],
+    }
+
+
+def build_generation_project_memory(payload_prompt: str, project_memory: Dict[str, Any], app_type: str, builder_mode: str, systems: List[str], has_generated_app: bool) -> Dict[str, Any]:
+    previous_memory = dict(project_memory or {})
+    decisions = dict(previous_memory.get("decisions") or {})
+    advice = build_project_advice(app_type, builder_mode, systems, decisions, has_generated_app)
+    global_knowledge_count = len(load_global_knowledge_store())
+    return {
+        **previous_memory,
+        "project_summary": payload_prompt or previous_memory.get("project_summary", ""),
+        "app_type": app_type,
+        "builder_mode": builder_mode,
+        "systems": systems,
+        "has_generated_app": has_generated_app,
+        "decisions": decisions,
+        "advice": advice,
+        "latest_research": previous_memory.get("latest_research") or {},
+        "knowledge_items": list(previous_memory.get("knowledge_items") or []),
+        "global_knowledge_count": global_knowledge_count,
+        "unresolved_questions": [],
+    }
+
+
+def build_clarifying_questions(message: str, app_type: str, systems: List[str], decisions: Dict[str, Any]) -> List[str]:
+    questions: List[str] = []
+    if decisions.get("auth_required") is None and not re.search(r"(login|auth|account|sign in|signup|user)", message):
+        questions.append("Should users sign in, or should this stay open to everyone?")
+    if decisions.get("billing_enabled") is None and "billing" not in systems and not re.search(r"(stripe|billing|subscription|paid|premium)", message):
+        questions.append("Do you want payments or subscriptions in the first version?")
+    if decisions.get("product_shape") is None and app_type == "tool app" and not re.search(r"(dashboard|admin|landing|chat|assistant|content|cms)", message):
+        questions.append("Should this be a simple tool, a dashboard, or a full SaaS-style app?")
+    return questions[:2]
+
+
+def build_suggested_actions(app_type: str, has_generated_app: bool, systems: List[str], builder_mode: str, research_recommendation: Optional[Dict[str, str]] = None) -> List[Dict[str, str]]:
+    actions: List[Dict[str, str]] = []
+    if research_recommendation and research_recommendation.get("prompt"):
+        actions.append({
+            "label": research_recommendation.get("label") or "Apply researched recommendation",
+            "prompt": research_recommendation.get("prompt") or "",
+            "mode": research_recommendation.get("mode") or ("mutate" if has_generated_app else "evolve"),
+        })
+
+    if not has_generated_app:
+        starter_prompt = {
+            "assistant app": "Build an AI assistant app with chat, saved history, and a tool panel",
+            "admin panel": "Build an admin dashboard with login, sidebar, analytics cards, and settings",
+            "content app": "Build a content studio with editor, preview, saved drafts, and notes",
+        }.get(app_type, "Build a web app with homepage, dashboard, login, and saved data")
+        actions.append({"label": "Build first version", "prompt": starter_prompt, "mode": "evolve"})
+
+    if has_generated_app:
+        actions.append({"label": "Add login", "prompt": "Add login, protected routes, and account state", "mode": "mutate"})
+        actions.append({"label": "Improve mobile", "prompt": "Make the current app mobile friendly with cleaner spacing and navigation", "mode": "mutate"})
+    else:
+        actions.append({"label": "SaaS starter", "prompt": "Build a SaaS web app with landing page, login, dashboard, billing, and settings", "mode": "evolve"})
+
+    if app_type != "assistant app":
+        actions.append({"label": "AI assistant mode", "prompt": "Turn this into an AI assistant app with chat, tools, saved history, and a dashboard", "mode": "evolve" if not has_generated_app else "mutate"})
+    if "billing" not in systems:
+        actions.append({"label": "Add billing", "prompt": "Add billing, pricing, and a paid plan upgrade flow", "mode": "mutate" if has_generated_app else "evolve"})
+    if builder_mode != "site-builder":
+        actions.append({"label": "Marketing page", "prompt": "Add a premium landing page and stronger marketing sections", "mode": "mutate" if has_generated_app else "evolve"})
+
+    return actions[:4]
+
+
+def build_project_memory(payload: ChatAgentRequest, app_type: str, builder_mode: str, systems: List[str], has_generated_app: bool, questions: List[str], suggested_actions: List[Dict[str, str]], research: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    previous_memory = dict(payload.project_memory or {})
+    decisions = infer_decisions_from_message(payload.message, previous_memory)
+    advice = build_project_advice(app_type, builder_mode, systems, decisions, has_generated_app)
+    knowledge_items = update_knowledge_bank(previous_memory, research)
+    global_knowledge_count = len(load_global_knowledge_store())
+    latest_research = research or previous_memory.get("latest_research") or {}
+    research_recommendation = build_research_recommendation(latest_research, has_generated_app, systems, app_type)
+    project_summary = payload.current_prompt or previous_memory.get("project_summary") or payload.message
+    if len(payload.message.split()) > 3:
+        project_summary = payload.message
+    return {
+        "project_id": payload.project_id or previous_memory.get("project_id", ""),
+        "project_summary": project_summary,
+        "app_type": app_type,
+        "builder_mode": builder_mode,
+        "systems": systems,
+        "has_generated_app": has_generated_app,
+        "last_user_request": payload.message,
+        "decisions": decisions,
+        "advice": advice,
+        "latest_research": latest_research,
+        "research_recommendation": research_recommendation,
+        "knowledge_items": knowledge_items,
+        "global_knowledge_count": global_knowledge_count,
+        "unresolved_questions": questions,
+        "last_suggested_actions": suggested_actions[:3],
+    }
+
+
+def build_memory_summary(memory: Dict[str, Any]) -> str:
+    systems = memory.get("systems") or []
+    decisions = memory.get("decisions") or {}
+    system_line = ", ".join(systems[:4]) if systems else "base storage"
+    unresolved = memory.get("unresolved_questions") or []
+    unresolved_line = f" Waiting on {len(unresolved)} clarification item(s)." if unresolved else ""
+    decision_parts = []
+    if decisions.get("auth_required") is True:
+        decision_parts.append("login required")
+    elif decisions.get("auth_required") is False:
+        decision_parts.append("open access")
+    if decisions.get("billing_enabled") is True:
+        decision_parts.append("billing enabled")
+    elif decisions.get("billing_enabled") is False:
+        decision_parts.append("no billing")
+    if decisions.get("product_shape"):
+        decision_parts.append(f"shape: {decisions['product_shape']}")
+    decision_line = f" Decisions: {', '.join(decision_parts)}." if decision_parts else ""
+    advice = memory.get("advice") or {}
+    advice_count = sum(len(advice.get(key) or []) for key in ["upgrades", "cautions", "better_options"])
+    advice_line = f" Advisor notes: {advice_count}." if advice_count else ""
+    research = memory.get("latest_research") or {}
+    research_line = " Research saved." if research.get("findings") else ""
+    recommendation = memory.get("research_recommendation") or {}
+    recommendation_line = " Research recommendation ready." if recommendation.get("prompt") else ""
+    knowledge_count = len(memory.get("knowledge_items") or [])
+    knowledge_line = f" Knowledge bank: {knowledge_count}." if knowledge_count else ""
+    global_knowledge_count = memory.get("global_knowledge_count") or 0
+    global_line = f" Global knowledge: {global_knowledge_count}." if global_knowledge_count else ""
+    return (
+        f"Project type: {memory.get('app_type', 'tool app')}. "
+        f"Mode: {memory.get('builder_mode', 'general-builder')}. "
+        f"Systems: {system_line}.{decision_line}{advice_line}{research_line}{recommendation_line}{knowledge_line}{global_line}{unresolved_line}"
+    )
+
+
+def build_agent_reply(payload: ChatAgentRequest) -> Dict[str, Any]:
+    message = payload.message.strip()
+    lowered = message.lower()
+    has_generated_app = bool(payload.generated_files or payload.routes or payload.components or payload.project_id)
+    previous_memory = dict(payload.project_memory or {})
+    decisions = infer_decisions_from_message(message, previous_memory)
+    app_type = payload.feature_state.get("appType") or previous_memory.get("app_type") or infer_app_type(message)
+    builder_mode = payload.feature_state.get("builderMode") or previous_memory.get("builder_mode") or infer_builder_mode(message)
+    systems = payload.system_planner.get("systems") or previous_memory.get("systems") or infer_systems(message, app_type)
+    systems = apply_decisions_to_systems(systems, decisions)
+    response_type = "apply"
+    assistant_message = ""
+    questions: List[str] = []
+    ready_to_apply = False
+    apply_mode = normalize_chat_mode(payload.chat_mode, has_generated_app)
+    apply_prompt = message
+    research: Dict[str, Any] = previous_memory.get("latest_research") or {}
+    research_recommendation = build_research_recommendation(research, has_generated_app, systems, app_type)
+    global_knowledge_items = load_global_knowledge_store()
+    combined_knowledge_items = merge_knowledge_items(list(previous_memory.get("knowledge_items") or []), global_knowledge_items, 48)
+    knowledge_hits = find_relevant_knowledge(message, combined_knowledge_items)
+    if knowledge_hits:
+        save_global_knowledge_store(mark_knowledge_usage(global_knowledge_items, knowledge_hits))
+
+    vague_build = bool(re.search(r"\b(app|website|web app|platform|tool)\b", lowered)) and len(message.split()) < 7
+    if needs_research(lowered):
+        response_type = "research"
+        ready_to_apply = False
+        research = run_research(build_research_query(message, app_type, builder_mode))
+        research_recommendation = build_research_recommendation(research, has_generated_app, systems, app_type)
+        if research.get("findings"):
+            save_global_knowledge_store(
+                merge_knowledge_items(
+                    load_global_knowledge_store(),
+                    research_findings_to_knowledge(research),
+                    250,
+                )
+            )
+        assistant_message = summarize_research(research, app_type, builder_mode)
+        if research_recommendation.get("prompt"):
+            assistant_message += f" My recommendation is {research_recommendation.get('label', 'the researched option')}. {research_recommendation.get('explanation', '')} I can also apply it now if you want."
+    elif research_recommendation.get("prompt") and is_affirmative(lowered) and not (previous_memory.get("unresolved_questions") or []):
+        response_type = "apply"
+        ready_to_apply = True
+        apply_mode = research_recommendation.get("mode") or normalize_chat_mode(payload.chat_mode, has_generated_app)
+        apply_prompt = research_recommendation.get("prompt") or message
+        assistant_message = (
+            f"I chose {research_recommendation.get('label', 'the researched option')} for this project. "
+            f"{research_recommendation.get('explanation', research_recommendation.get('reason') or '')} "
+            "I am applying it now."
+        ).strip()
+    elif is_suggestion_request(lowered):
+        response_type = "suggest"
+        ready_to_apply = False
+        assistant_message = (
+            f"I recommend starting with a {app_type} in {builder_mode} mode. "
+            "A strong first version should include a clear homepage, a main workspace, saved data, and one focused upgrade path. "
+            "Pick one of the suggested actions, or tell me your niche and I will shape the first version for it."
+        )
+        if knowledge_hits:
+            assistant_message += f" I am also using {len(knowledge_hits)} saved knowledge item(s) from earlier research on similar topics."
+    elif is_explanation_request(lowered) and not is_mutation_request(lowered):
+        response_type = "explain"
+        ready_to_apply = False
+        system_line = ", ".join(systems[:4]) if systems else "storage"
+        assistant_message = (
+            f"Right now I would treat this as a {app_type} in {builder_mode} mode. "
+            f"The main systems I would plan are {system_line}. "
+            "If you want, I can apply that plan now or narrow it into a simpler first version."
+        )
+        if knowledge_hits:
+            assistant_message += " I also found matching saved knowledge that can guide the choice below."
+    elif not has_generated_app and (vague_build or message in {"app", "website", "build me something", "build app"}):
+        response_type = "clarify"
+        ready_to_apply = False
+        questions = build_clarifying_questions(lowered, app_type, systems, decisions)
+        assistant_message = "I can build that, but I need one or two details first so the first version is useful instead of generic."
+    elif has_generated_app and is_mutation_request(lowered):
+        response_type = "apply"
+        ready_to_apply = True
+        apply_mode = "mutate"
+        assistant_message = "I understand the change and I am ready to apply it to the current project now."
+    elif not has_generated_app and re.search(r"(build|create|make|start|generate)", lowered):
+        detail_score = sum(
+            1
+            for pattern in [
+                r"(login|auth|account)",
+                r"(dashboard|admin|portal)",
+                r"(chat|assistant|ai)",
+                r"(billing|subscription|pricing)",
+                r"(database|saved|history|storage)",
+                r"(mobile|responsive)",
+            ]
+            if re.search(pattern, lowered)
+        )
+        if detail_score == 0 and len(message.split()) < 12:
+            response_type = "clarify"
+            ready_to_apply = False
+            questions = build_clarifying_questions(lowered, app_type, systems, decisions)
+            assistant_message = "I can build the first version, but I need a little more direction so I choose the right screens and systems."
+        else:
+            response_type = "apply"
+            ready_to_apply = True
+            apply_mode = "evolve"
+            assistant_message = "I understand the app direction and I am ready to build the first version now."
+    elif has_generated_app:
+        response_type = "apply"
+        ready_to_apply = True
+        apply_mode = "mutate"
+        assistant_message = "I can apply that to the current project now."
+    else:
+        response_type = "clarify"
+        ready_to_apply = False
+        questions = build_clarifying_questions(lowered, app_type, systems, decisions)
+        assistant_message = "Tell me a bit more about the app you want, and I will shape the first version with the right layout and systems."
+
+    suggested_actions = build_suggested_actions(app_type, has_generated_app, systems, builder_mode, research_recommendation)
+    project_memory = build_project_memory(payload, app_type, builder_mode, systems, has_generated_app, questions, suggested_actions, research)
+    advice = project_memory.get("advice") or {"upgrades": [], "cautions": [], "better_options": []}
+
+    return {
+        "ok": True,
+        "response_type": response_type,
+        "assistant_message": assistant_message,
+        "questions": questions,
+        "suggested_actions": suggested_actions,
+        "advice": advice,
+        "research_findings": research.get("findings") or [],
+        "research_query": research.get("query") or "",
+        "knowledge_hits": knowledge_hits,
+        "research_recommendation": project_memory.get("research_recommendation") or {},
+        "ready_to_apply": ready_to_apply,
+        "apply_mode": apply_mode,
+        "apply_prompt": apply_prompt,
+        "project_memory": project_memory,
+        "memory_summary": build_memory_summary(project_memory),
+        "analysis": {
+            "app_type": app_type,
+            "builder_mode": builder_mode,
+            "systems": systems,
+            "has_generated_app": has_generated_app,
+        },
+    }
 
 
 def infer_systems(prompt: str, app_type: str) -> List[str]:
@@ -1452,10 +2263,13 @@ def generate_code_bundle(prompt: str, app_type: str, builder_mode: str, style: s
 @app.post("/mutate")
 def mutate(payload: MutateRequest):
     prompt = payload.prompt.strip()
-    app_type = infer_app_type(prompt)
-    builder_mode = infer_builder_mode(prompt)
+  decisions = infer_decisions_from_message(prompt, payload.project_memory or {})
+  app_type = payload.project_memory.get("app_type") or infer_app_type(prompt)
+  builder_mode = payload.project_memory.get("builder_mode") or infer_builder_mode(prompt)
+  app_type, builder_mode = apply_decisions_to_product(app_type, builder_mode, decisions)
     summary_style = infer_summary_style(prompt)
-    systems = payload.systems or infer_systems(prompt, app_type)
+  systems = payload.systems or payload.project_memory.get("systems") or infer_systems(prompt, app_type)
+  systems = apply_decisions_to_systems(systems, decisions)
     persistence = infer_persistence(prompt, systems, payload.complexity or "mvp")
     modules = recommend_modules(prompt, app_type)
     layout = build_layout(prompt, payload.current_layout)
@@ -1463,6 +2277,7 @@ def mutate(payload: MutateRequest):
     routes = build_routes(app_type, prompt, systems)
     components = build_components(app_type, systems)
     summary = build_mutation_summary(layout, modules, app_type, builder_mode, systems, persistence)
+  project_memory = build_generation_project_memory(prompt, payload.project_memory, app_type, builder_mode, systems, True)
 
     return {
         "ok": True,
@@ -1478,6 +2293,7 @@ def mutate(payload: MutateRequest):
         "routes": routes,
         "components": components,
         "mutation_summary": summary,
+        "project_memory": project_memory,
         "next_best_actions": [
             "materialize files",
             "wire api data flow",
@@ -1490,12 +2306,16 @@ def mutate(payload: MutateRequest):
 @app.post("/generate-code")
 def generate_code(payload: GenerateCodeRequest):
     prompt = payload.prompt.strip()
-    app_type = payload.app_type or infer_app_type(prompt)
-    builder_mode = payload.builder_mode or infer_builder_mode(prompt)
-    systems = payload.systems or infer_systems(prompt, app_type)
+  decisions = infer_decisions_from_message(prompt, payload.project_memory or {})
+  app_type = payload.app_type or payload.project_memory.get("app_type") or infer_app_type(prompt)
+  builder_mode = payload.builder_mode or payload.project_memory.get("builder_mode") or infer_builder_mode(prompt)
+  app_type, builder_mode = apply_decisions_to_product(app_type, builder_mode, decisions)
+  systems = payload.systems or payload.project_memory.get("systems") or infer_systems(prompt, app_type)
+  systems = apply_decisions_to_systems(systems, decisions)
     style = payload.style or "dark glass"
     complexity = payload.complexity or "mvp"
     persistence = payload.persistence or infer_persistence(prompt, systems, complexity)
+  project_memory = build_generation_project_memory(prompt, payload.project_memory, app_type, builder_mode, systems, True)
 
     monetization_config = payload.monetization_config or {}
     template_key = payload.rv_template_key or ("rv_power" if builder_mode == "battery-planner" else "rv_diagnostics" if "ai-tools" in systems else "rv_maintenance")
@@ -1531,6 +2351,7 @@ def generate_code(payload: GenerateCodeRequest):
         "entry_file": "frontend/src/main.jsx",
         "app_file": "frontend/src/App.jsx",
         "backend_entry": "backend/main.py",
+        "project_memory": project_memory,
         "data_flow": {
             "frontend_client": "frontend/src/lib/api.js",
             "backend_routes": ["GET /api/items", "POST /api/items", "PUT /api/items/{id}", "DELETE /api/items/{id}"],
@@ -1540,3 +2361,8 @@ def generate_code(payload: GenerateCodeRequest):
         "monetization_wired": True,
         "summary": f"Generated {len(files)} files for a {app_type} in {builder_mode} mode with {persistence} persistence and live data flow.",
     }
+
+
+    @app.post("/chat-agent")
+    def chat_agent(payload: ChatAgentRequest):
+      return build_agent_reply(payload)
