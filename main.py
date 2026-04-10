@@ -1022,12 +1022,13 @@ def build_project_advice(app_type: str, builder_mode: str, systems: List[str], d
     upgrades: List[Dict[str, str]] = []
     cautions: List[Dict[str, str]] = []
     better_options: List[Dict[str, str]] = []
+    is_calculator_tool = app_type == "tool app" and builder_mode == "battery-planner"
 
     if "auth" not in systems and app_type in {"admin panel", "assistant app"}:
         upgrades.append({"label": "Add login", "reason": "Protected workspaces usually need accounts, saved state, and project ownership."})
     if "storage" in systems and "billing" not in systems and has_generated_app:
         upgrades.append({"label": "Add paid tier", "reason": "Once users can save data, premium export, team features, or higher limits become realistic upgrades."})
-    if builder_mode != "site-builder":
+    if builder_mode != "site-builder" and not is_calculator_tool and (has_generated_app or app_type in {"assistant app", "content app", "admin panel"}):
         upgrades.append({"label": "Add marketing page", "reason": "A strong landing page makes the project easier to explain, test, and ship."})
 
     if decisions.get("billing_enabled") is True and decisions.get("auth_required") is False:
@@ -1037,7 +1038,7 @@ def build_project_advice(app_type: str, builder_mode: str, systems: List[str], d
     if builder_mode == "site-builder" and "billing" in systems:
         cautions.append({"label": "Keep the site simple first", "reason": "Landing pages usually convert better before you add subscriptions, portals, or complex app state."})
 
-    if decisions.get("product_shape") == "tool" and "dashboard" in systems:
+    if (decisions.get("product_shape") == "tool" or is_calculator_tool) and "dashboard" in systems:
         better_options.append({"label": "Start with a single focused tool", "reason": "Ship one excellent calculator or workflow first, then add dashboard history later."})
     if decisions.get("auth_required") is False and app_type == "assistant app":
         better_options.append({"label": "Use guest mode first", "reason": "Let users try the assistant instantly, then add account save features after value is proven."})
@@ -1119,6 +1120,11 @@ def build_project_id(raw_project_id: str) -> str:
 
 def build_clarifying_questions(message: str, app_type: str, systems: List[str], decisions: Dict[str, Any]) -> List[str]:
     questions: List[str] = []
+    is_calculator_tool = app_type == "tool app" and bool(re.search(r"(battery|solar|inverter|calculator|estimate|power needed)", message))
+    if is_calculator_tool:
+        if decisions.get("product_shape") is None:
+            questions.append("Should this stay a simple calculator, or do you also want saved plans later?")
+        return questions[:1]
     if decisions.get("auth_required") is None and not re.search(r"(login|auth|account|sign in|signup|user)", message):
         questions.append("Should users sign in, or should this stay open to everyone?")
     if decisions.get("billing_enabled") is None and "billing" not in systems and not re.search(r"(stripe|billing|subscription|paid|premium)", message):
@@ -1413,7 +1419,10 @@ def build_agent_reply(payload: ChatAgentRequest) -> Dict[str, Any]:
     decisions = infer_decisions_from_message(message, previous_memory)
     app_type = payload.feature_state.get("appType") or previous_memory.get("app_type") or infer_app_type(message)
     builder_mode = payload.feature_state.get("builderMode") or previous_memory.get("builder_mode") or infer_builder_mode(message)
-    systems = payload.system_planner.get("systems") or previous_memory.get("systems") or infer_systems(message, app_type)
+    if has_generated_app or previous_memory.get("project_summary"):
+        systems = payload.system_planner.get("systems") or previous_memory.get("systems") or infer_systems(message, app_type)
+    else:
+        systems = infer_systems(message, app_type)
     systems = apply_decisions_to_systems(systems, decisions)
     response_type = "apply"
     assistant_message = ""
@@ -1587,6 +1596,9 @@ def infer_systems(prompt: str, app_type: str) -> List[str]:
         systems.update(["storage", "settings"])
     else:
         systems.update(["storage"])
+
+    if re.search(r"(battery|solar|power|inverter|calculator|estimate)", p):
+        systems.add("tools")
 
     if re.search(r"(login|auth|account|signin|sign in|register|user)", p):
         systems.add("auth")
