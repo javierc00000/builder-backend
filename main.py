@@ -99,6 +99,30 @@ class GenerateCodeRequest(BaseModel):
     monetization_config: Dict[str, Any] = Field(default_factory=dict)
 
 
+class OrchestrateRequest(BaseModel):
+    prompt: str
+    project_id: str = ""
+    app_type: str = ""
+    builder_mode: str = ""
+    style: str = "dark glass"
+    routes: List[Dict[str, Any]] = Field(default_factory=list)
+    components: List[Dict[str, Any]] = Field(default_factory=list)
+    current_files: List[Dict[str, Any]] = Field(default_factory=list)
+    current_layout: Dict[str, Any] = Field(default_factory=dict)
+    active_modules: List[str] = Field(default_factory=list)
+    feature_state: Dict[str, Any] = Field(default_factory=dict)
+    project_memory: Dict[str, Any] = Field(default_factory=dict)
+    system_planner: Dict[str, Any] = Field(default_factory=dict)
+    system_prompt: str = ""
+    systems: List[str] = Field(default_factory=list)
+    complexity: str = ""
+    architecture: Dict[str, Any] = Field(default_factory=dict)
+    persistence: str = ""
+    rv_template_key: str = "rv_power"
+    rv_camping_profile: str = "weekend"
+    monetization_config: Dict[str, Any] = Field(default_factory=dict)
+
+
 class ChatAgentRequest(BaseModel):
     message: str
     project_id: str = ""
@@ -837,6 +861,13 @@ def build_generation_project_memory(payload_prompt: str, project_memory: Dict[st
         "global_knowledge_count": global_knowledge_count,
         "unresolved_questions": [],
     }
+
+
+def build_project_id(raw_project_id: str) -> str:
+    cleaned = str(raw_project_id or "").strip()
+    if cleaned:
+        return cleaned
+    return f"proj-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
 
 
 def build_clarifying_questions(message: str, app_type: str, systems: List[str], decisions: Dict[str, Any]) -> List[str]:
@@ -2360,6 +2391,87 @@ def generate_code(payload: GenerateCodeRequest):
         "monetization": monetization,
         "monetization_wired": True,
         "summary": f"Generated {len(files)} files for a {app_type} in {builder_mode} mode with {persistence} persistence and live data flow.",
+    }
+
+
+@app.post("/orchestrate")
+def orchestrate(payload: OrchestrateRequest):
+    prompt = payload.prompt.strip()
+    decisions = infer_decisions_from_message(prompt, payload.project_memory or {})
+    app_type = payload.app_type or payload.project_memory.get("app_type") or infer_app_type(prompt)
+    builder_mode = payload.builder_mode or payload.project_memory.get("builder_mode") or infer_builder_mode(prompt)
+    app_type, builder_mode = apply_decisions_to_product(app_type, builder_mode, decisions)
+    systems = (
+        payload.systems
+        or payload.system_planner.get("systems")
+        or payload.project_memory.get("systems")
+        or infer_systems(prompt, app_type)
+    )
+    systems = apply_decisions_to_systems(systems, decisions)
+    complexity = payload.complexity or payload.system_planner.get("complexity") or "mvp"
+    style = payload.style or "dark glass"
+    persistence = payload.persistence or infer_persistence(prompt, systems, complexity)
+    modules = recommend_modules(prompt, app_type)
+    layout = build_layout(prompt, payload.current_layout)
+    file_tree = build_file_tree(app_type, builder_mode, prompt, systems, persistence)
+    routes = payload.routes or build_routes(app_type, prompt, systems)
+    components = payload.components or build_components(app_type, systems)
+    summary = build_mutation_summary(layout, modules, app_type, builder_mode, systems, persistence)
+    project_memory = build_generation_project_memory(prompt, payload.project_memory, app_type, builder_mode, systems, True)
+    project_id = build_project_id(payload.project_id)
+
+    monetization_config = payload.monetization_config or {}
+    template_key = payload.rv_template_key or ("rv_power" if builder_mode == "battery-planner" else "rv_diagnostics" if "ai-tools" in systems else "rv_maintenance")
+    camping_profile = payload.rv_camping_profile or "weekend"
+    monetization = build_rv_monetization_plan(
+        template_key,
+        camping_profile,
+        180 if builder_mode == "battery-planner" else 120,
+        400 if builder_mode == "battery-planner" else 220,
+        2000 if builder_mode == "battery-planner" else 1500,
+        float(monetization_config.get("monthlyPrice", 9.99) or 9.99),
+        float(monetization_config.get("yearlyPrice", 69.99) or 69.99),
+        str(monetization_config.get("affiliateTagCa", "rvinspector03-20") or "rvinspector03-20"),
+        str(monetization_config.get("affiliateTagUs", "rvinspectorpr-20") or "rvinspectorpr-20"),
+    )
+    files = generate_code_bundle(prompt, app_type, builder_mode, style, systems, persistence, monetization)
+
+    return {
+        "ok": True,
+        "project_id": project_id,
+        "prompt": prompt,
+        "app_type": app_type,
+        "builder_mode": builder_mode,
+        "style": style,
+        "systems": systems,
+        "complexity": complexity,
+        "persistence": persistence,
+        "files": files,
+        "generated_files": files,
+        "routes": routes,
+        "components": components,
+        "file_tree": file_tree,
+        "layout_changes": layout,
+        "module_changes": {"enable": modules, "disable": []},
+        "mutation_summary": summary,
+        "project_memory": project_memory,
+        "monetization": monetization,
+        "next_best_actions": [
+            "materialize files",
+            "wire api data flow",
+            "export this app for render",
+            "improve mobile",
+        ],
+        "project_state": {
+            "project_id": project_id,
+            "files": files,
+            "routes": routes,
+            "components": components,
+            "file_tree": file_tree,
+            "layout": layout,
+            "modules": modules,
+        },
+        "summary": f"Orchestrated project {project_id} with {len(files)} files for a {app_type} in {builder_mode} mode.",
     }
 
 @app.post("/chat-agent")
