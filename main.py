@@ -2263,13 +2263,13 @@ def generate_code_bundle(prompt: str, app_type: str, builder_mode: str, style: s
 @app.post("/mutate")
 def mutate(payload: MutateRequest):
     prompt = payload.prompt.strip()
-  decisions = infer_decisions_from_message(prompt, payload.project_memory or {})
-  app_type = payload.project_memory.get("app_type") or infer_app_type(prompt)
-  builder_mode = payload.project_memory.get("builder_mode") or infer_builder_mode(prompt)
-  app_type, builder_mode = apply_decisions_to_product(app_type, builder_mode, decisions)
+    decisions = infer_decisions_from_message(prompt, payload.project_memory or {})
+    app_type = payload.project_memory.get("app_type") or infer_app_type(prompt)
+    builder_mode = payload.project_memory.get("builder_mode") or infer_builder_mode(prompt)
+    app_type, builder_mode = apply_decisions_to_product(app_type, builder_mode, decisions)
     summary_style = infer_summary_style(prompt)
-  systems = payload.systems or payload.project_memory.get("systems") or infer_systems(prompt, app_type)
-  systems = apply_decisions_to_systems(systems, decisions)
+    systems = payload.systems or payload.project_memory.get("systems") or infer_systems(prompt, app_type)
+    systems = apply_decisions_to_systems(systems, decisions)
     persistence = infer_persistence(prompt, systems, payload.complexity or "mvp")
     modules = recommend_modules(prompt, app_type)
     layout = build_layout(prompt, payload.current_layout)
@@ -2277,7 +2277,7 @@ def mutate(payload: MutateRequest):
     routes = build_routes(app_type, prompt, systems)
     components = build_components(app_type, systems)
     summary = build_mutation_summary(layout, modules, app_type, builder_mode, systems, persistence)
-  project_memory = build_generation_project_memory(prompt, payload.project_memory, app_type, builder_mode, systems, True)
+    project_memory = build_generation_project_memory(prompt, payload.project_memory, app_type, builder_mode, systems, True)
 
     return {
         "ok": True,
@@ -2306,16 +2306,16 @@ def mutate(payload: MutateRequest):
 @app.post("/generate-code")
 def generate_code(payload: GenerateCodeRequest):
     prompt = payload.prompt.strip()
-  decisions = infer_decisions_from_message(prompt, payload.project_memory or {})
-  app_type = payload.app_type or payload.project_memory.get("app_type") or infer_app_type(prompt)
-  builder_mode = payload.builder_mode or payload.project_memory.get("builder_mode") or infer_builder_mode(prompt)
-  app_type, builder_mode = apply_decisions_to_product(app_type, builder_mode, decisions)
-  systems = payload.systems or payload.project_memory.get("systems") or infer_systems(prompt, app_type)
-  systems = apply_decisions_to_systems(systems, decisions)
+    decisions = infer_decisions_from_message(prompt, payload.project_memory or {})
+    app_type = payload.app_type or payload.project_memory.get("app_type") or infer_app_type(prompt)
+    builder_mode = payload.builder_mode or payload.project_memory.get("builder_mode") or infer_builder_mode(prompt)
+    app_type, builder_mode = apply_decisions_to_product(app_type, builder_mode, decisions)
+    systems = payload.systems or payload.project_memory.get("systems") or infer_systems(prompt, app_type)
+    systems = apply_decisions_to_systems(systems, decisions)
     style = payload.style or "dark glass"
     complexity = payload.complexity or "mvp"
     persistence = payload.persistence or infer_persistence(prompt, systems, complexity)
-  project_memory = build_generation_project_memory(prompt, payload.project_memory, app_type, builder_mode, systems, True)
+    project_memory = build_generation_project_memory(prompt, payload.project_memory, app_type, builder_mode, systems, True)
 
     monetization_config = payload.monetization_config or {}
     template_key = payload.rv_template_key or ("rv_power" if builder_mode == "battery-planner" else "rv_diagnostics" if "ai-tools" in systems else "rv_maintenance")
@@ -2362,7 +2362,6 @@ def generate_code(payload: GenerateCodeRequest):
         "summary": f"Generated {len(files)} files for a {app_type} in {builder_mode} mode with {persistence} persistence and live data flow.",
     }
 
-
-    @app.post("/chat-agent")
-    def chat_agent(payload: ChatAgentRequest):
-      return build_agent_reply(payload)
+@app.post("/chat-agent")
+def chat_agent(payload: ChatAgentRequest):
+    return build_agent_reply(payload)
