@@ -5,6 +5,7 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
 import re
 import json
+import os
 from pathlib import Path
 
 try:
@@ -36,7 +37,13 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "service": "builder-backend-v6", "data_flow": True, "rv_monetization": True}
+    return {
+        "status": "healthy",
+        "service": "builder-backend-v6",
+        "data_flow": True,
+        "rv_monetization": True,
+        "workspace_edit": bool(get_workspace_root()),
+    }
 
 
 @app.get("/knowledge-store")
@@ -139,6 +146,28 @@ class ChatAgentRequest(BaseModel):
     components: List[Dict[str, Any]] = Field(default_factory=list)
     system_planner: Dict[str, Any] = Field(default_factory=dict)
     chat_mode: str = "evolve"
+    reply_preference: str = "balanced"
+    recent_messages: List[Dict[str, str]] = Field(default_factory=list)
+
+
+class RepoEditRequest(BaseModel):
+    prompt: str
+    current_files: List[Dict[str, Any]] = Field(default_factory=list)
+    app_type: str = ""
+    builder_mode: str = ""
+    style: str = "dark glass"
+    target_scope: str = "fullstack"
+    project_memory: Dict[str, Any] = Field(default_factory=dict)
+    feature_state: Dict[str, Any] = Field(default_factory=dict)
+    system_planner: Dict[str, Any] = Field(default_factory=dict)
+    systems: List[str] = Field(default_factory=list)
+    complexity: str = ""
+    architecture: Dict[str, Any] = Field(default_factory=dict)
+    persistence: str = ""
+
+
+class WorkspaceEditRequest(RepoEditRequest):
+    workspace_subdir: str = ""
 
 class RvMonetizationRequest(BaseModel):
     template_key: str = "rv_power"
@@ -365,7 +394,68 @@ def is_suggestion_request(message: str) -> bool:
 
 
 def is_explanation_request(message: str) -> bool:
-    return bool(re.search(r"(why|how does|how do|what is|explain|walk me through|show me what)", message))
+    return bool(re.search(r"(why|how does|how do|what is|explain|walk me through|show me what|can it|can you|could you|does it|will it|is it able)", message))
+
+
+def is_question_message(message: str) -> bool:
+    stripped = str(message or "").strip()
+    if not stripped:
+        return False
+    if "?" in stripped:
+        return True
+    return bool(re.match(r"^(can|could|would|will|does|do|is|are|am|should|what|why|how|when|where)\b", stripped))
+
+
+def is_followup_question(message: str, recent_messages: List[Dict[str, str]]) -> bool:
+    stripped = str(message or "").strip().lower()
+    if not stripped:
+        return False
+    if is_question_message(stripped):
+        return True
+    if len(stripped.split()) > 5 or not recent_messages:
+        return False
+    return bool(re.fullmatch(r"(why|how|what about that|what about this|and backend|and frontend|what next|can it|does it|will it)", stripped))
+
+
+def normalize_reply_preference(preference: str) -> str:
+    normalized = str(preference or "balanced").strip().lower()
+    if normalized in {"answer", "clarify", "apply", "balanced"}:
+        return normalized
+    return "balanced"
+
+
+def summarize_recent_context(recent_messages: List[Dict[str, str]]) -> str:
+    parts: List[str] = []
+    for item in recent_messages[-4:]:
+        role = str(item.get("role") or "user").strip().lower()
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        label = "You" if role == "user" else "Builder"
+        parts.append(f"{label}: {text}")
+    return " ".join(parts)
+
+
+def build_followup_actions(response_type: str, has_generated_app: bool) -> List[Dict[str, str]]:
+    if response_type == "answer":
+        return [
+            {"label": "Tell me more", "prompt": "tell me more about that", "mode": "evolve"},
+            {"label": "Ask what you need", "prompt": "ask me what details you need first", "mode": "evolve"},
+            {"label": "Apply this now", "prompt": "apply that now", "mode": "mutate" if has_generated_app else "evolve"},
+        ]
+    if response_type == "explain":
+        return [
+            {"label": "Make it simpler", "prompt": "make that simpler", "mode": "evolve"},
+            {"label": "What do you recommend?", "prompt": "what do you recommend next", "mode": "evolve"},
+            {"label": "Apply this plan", "prompt": "apply that plan now", "mode": "mutate" if has_generated_app else "evolve"},
+        ]
+    if response_type == "clarify":
+        return [
+            {"label": "Ask me the questions", "prompt": "ask me the questions one by one", "mode": "evolve"},
+            {"label": "Keep it simple", "prompt": "keep the first version simple", "mode": "evolve"},
+            {"label": "Show a starter idea", "prompt": "show me a good starter idea", "mode": "evolve"},
+        ]
+    return []
 
 
 def is_mutation_request(message: str) -> bool:
@@ -467,6 +557,120 @@ def build_research_query(message: str, app_type: str, builder_mode: str) -> str:
         parts.append(builder_mode)
     parts.append("web app development best practices")
     return " ".join(part for part in parts if part)
+
+
+def normalize_repo_scope(scope: str) -> str:
+    normalized = str(scope or "").strip().lower()
+    if normalized in {"frontend", "backend", "fullstack"}:
+        return normalized
+    if normalized in {"full-stack", "full_stack", "frontend-and-backend", "frontend+backend"}:
+        return "fullstack"
+    return "fullstack"
+
+
+def normalize_repo_files(files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for index, item in enumerate(files or []):
+        path = str((item or {}).get("path") or f"file-{index + 1}.txt").lstrip("/")
+        normalized.append({
+            "path": path,
+            "content": str((item or {}).get("content") or ""),
+            "language": (item or {}).get("language") or "text",
+        })
+    return normalized
+
+
+def matches_repo_scope(path: str, scope: str) -> bool:
+    lower = str(path or "").lower()
+    normalized_scope = normalize_repo_scope(scope)
+    is_backend = lower.startswith("backend/") or lower.endswith(".py") or lower.endswith("requirements.txt") or lower.endswith(".sql")
+    is_frontend = lower.startswith("frontend/") or lower.startswith("src/") or lower.endswith(".jsx") or lower.endswith(".tsx") or lower.endswith(".js") or lower.endswith(".ts") or lower.endswith(".css") or lower.endswith("index.html")
+    if normalized_scope == "frontend":
+        return is_frontend and not is_backend
+    if normalized_scope == "backend":
+        return is_backend and not lower.startswith("frontend/")
+    return is_frontend or is_backend or lower in {"readme.md", ".env.example", ".gitignore"}
+
+
+def merge_repo_edit_files(current_files: List[Dict[str, Any]], generated_files: List[Dict[str, Any]], target_scope: str) -> tuple[List[Dict[str, Any]], List[str]]:
+    normalized_current = normalize_repo_files(current_files)
+    normalized_generated = normalize_repo_files(generated_files)
+    merged: Dict[str, Dict[str, Any]] = {item["path"]: item for item in normalized_current}
+    changed_paths: List[str] = []
+
+    for generated in normalized_generated:
+        path = generated["path"]
+        if not matches_repo_scope(path, target_scope):
+            continue
+        previous = merged.get(path)
+        merged[path] = generated
+        if previous is None or previous.get("content") != generated.get("content"):
+            changed_paths.append(path)
+
+    return list(merged.values()), sorted(set(changed_paths))
+
+
+def get_workspace_root() -> Optional[Path]:
+    raw_root = str(os.getenv("BUILDER_WORKSPACE_ROOT", "")).strip()
+    if not raw_root:
+        return None
+    root = Path(raw_root).expanduser().resolve()
+    return root if root.exists() and root.is_dir() else None
+
+
+def resolve_workspace_target(root: Path, workspace_subdir: str = "") -> Path:
+    relative = str(workspace_subdir or "").strip().replace("\\", "/").strip("/")
+    target = (root / relative).resolve() if relative else root.resolve()
+    if target != root and root not in target.parents:
+        raise ValueError("Workspace target must stay inside the configured workspace root.")
+    return target
+
+
+def write_workspace_files(root: Path, files: List[Dict[str, Any]], changed_paths: List[str]) -> Dict[str, Any]:
+    written: List[str] = []
+    backup_entries: List[Dict[str, Any]] = []
+    file_map = {str(item.get("path") or ""): item for item in normalize_repo_files(files)}
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    backup_root = root / ".builder-backups" / timestamp
+    manifest_rel_path = f".builder-backups/{timestamp}/manifest.json"
+    for relative_path in changed_paths:
+        file_entry = file_map.get(relative_path)
+        if not file_entry:
+            continue
+        destination = (root / relative_path).resolve()
+        if destination != root and root not in destination.parents:
+            raise ValueError(f"Refusing to write outside workspace root: {relative_path}")
+        if destination.exists():
+            backup_target = (backup_root / relative_path).resolve()
+            backup_target.parent.mkdir(parents=True, exist_ok=True)
+            backup_target.write_text(destination.read_text(encoding="utf-8"), encoding="utf-8")
+            backup_entries.append({
+                "path": relative_path,
+                "backup_path": str(Path(".builder-backups") / timestamp / relative_path).replace("\\", "/"),
+                "status": "updated",
+            })
+        else:
+            backup_entries.append({
+                "path": relative_path,
+                "backup_path": "",
+                "status": "created",
+            })
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(str(file_entry.get("content") or ""), encoding="utf-8")
+        written.append(relative_path)
+    manifest_path = (root / manifest_rel_path).resolve()
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps({
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "root": str(root),
+        "files": backup_entries,
+    }, indent=2), encoding="utf-8")
+    return {
+        "written_files": written,
+        "backup_manifest": manifest_rel_path,
+        "backup_entries": backup_entries,
+        "backup_count": len([item for item in backup_entries if item.get("backup_path")]),
+    }
 
 
 def run_research(query: str, max_results: int = 5) -> Dict[str, Any]:
@@ -921,7 +1125,7 @@ def build_clarifying_questions(message: str, app_type: str, systems: List[str], 
         questions.append("Do you want payments or subscriptions in the first version?")
     if decisions.get("product_shape") is None and app_type == "tool app" and not re.search(r"(dashboard|admin|landing|chat|assistant|content|cms)", message):
         questions.append("Should this be a simple tool, a dashboard, or a full SaaS-style app?")
-    return questions[:2]
+    return questions[:1]
 
 
 def build_suggested_actions(app_type: str, has_generated_app: bool, systems: List[str], builder_mode: str, research_recommendation: Optional[Dict[str, str]] = None) -> List[Dict[str, str]]:
@@ -957,6 +1161,106 @@ def build_suggested_actions(app_type: str, has_generated_app: bool, systems: Lis
     return actions[:4]
 
 
+def personalize_improvement_reason(base_reason: str, message: str, previous_memory: Optional[Dict[str, Any]] = None) -> str:
+    lowered = str(message or "").lower()
+    previous_memory = previous_memory or {}
+    decisions = dict(previous_memory.get("decisions") or {})
+    unresolved = list(previous_memory.get("unresolved_questions") or [])
+    project_summary = str(previous_memory.get("project_summary") or "").strip()
+    if re.search(r"(login|auth|account|sign in)", lowered):
+        return f"{base_reason} You already asked about login or accounts, so this matches the current direction."
+    if re.search(r"(dashboard|report|analytics|saved|history)", lowered):
+        return f"{base_reason} It also fits the saved data and dashboard direction you mentioned."
+    if re.search(r"(mobile|phone|responsive|tablet)", lowered):
+        return f"{base_reason} You also mentioned mobile needs, so this keeps that moving."
+    if re.search(r"(backend|api|database|server)", lowered):
+        return f"{base_reason} It also supports the backend work you asked about."
+    if re.search(r"(frontend|ui|design|layout|preview)", lowered):
+        return f"{base_reason} It also improves the interface direction you asked for."
+    if unresolved:
+        return f"{base_reason} It also moves the project forward while one detail is still open: {unresolved[0]}"
+    if decisions.get("auth_required") is False:
+        return f"{base_reason} This also respects your choice to keep the first version open without login."
+    if decisions.get("billing_enabled") is False:
+        return f"{base_reason} This also respects your choice to keep billing out of the first version."
+    if project_summary:
+        return f"{base_reason} It stays aligned with the project you described: {project_summary[:120]}"
+    return base_reason
+
+
+def build_next_improvement_action(
+    app_type: str,
+    has_generated_app: bool,
+    systems: List[str],
+    builder_mode: str,
+    message: str = "",
+    previous_memory: Optional[Dict[str, Any]] = None,
+) -> Dict[str, str]:
+    previous_memory = previous_memory or {}
+    decisions = dict(previous_memory.get("decisions") or {})
+    if not has_generated_app:
+        starter_prompt = {
+            "assistant app": "Build a simple AI assistant with chat, saved history, and one clean workspace",
+            "admin panel": "Build a simple admin dashboard with login, sidebar, and key overview cards",
+            "content app": "Build a simple content studio with editor, preview, and saved drafts",
+        }.get(app_type, "Build a simple first version with one main screen, saved data, and a clear next step")
+        return {
+            "label": "Best next improvement",
+            "reason": personalize_improvement_reason("Start with one focused first version before adding extra features.", message, previous_memory),
+            "prompt": starter_prompt,
+            "mode": "evolve",
+        }
+
+    if "auth" not in systems and app_type in {"assistant app", "admin panel", "content app"} and decisions.get("auth_required") is not False:
+        return {
+            "label": "Best next improvement",
+            "reason": personalize_improvement_reason("This project will feel more complete once people can sign in and save their work.", message, previous_memory),
+            "prompt": "Add login, protected routes, and account state",
+            "mode": "mutate",
+        }
+    if "billing" not in systems and decisions.get("billing_enabled") is not False:
+        return {
+            "label": "Best next improvement",
+            "reason": personalize_improvement_reason("A simple upgrade path is often the cleanest next product step after the core app works.", message, previous_memory),
+            "prompt": "Add a simple paid upgrade path with pricing and billing entry points",
+            "mode": "mutate",
+        }
+    if builder_mode != "site-builder":
+        return {
+            "label": "Best next improvement",
+            "reason": personalize_improvement_reason("Mobile polish usually improves the app quickly without changing the core product idea.", message, previous_memory),
+            "prompt": "Improve the app for mobile with cleaner spacing, navigation, and touch-friendly layout",
+            "mode": "mutate",
+        }
+    return {
+        "label": "Best next improvement",
+        "reason": personalize_improvement_reason("A clearer landing page is the simplest next improvement for a site-first product.", message, previous_memory),
+        "prompt": "Improve the landing page with clearer sections, stronger copy, and better conversion flow",
+        "mode": "mutate",
+    }
+
+
+def merge_action_lists(*action_groups: List[Dict[str, str]], limit: int = 5) -> List[Dict[str, str]]:
+    merged: List[Dict[str, str]] = []
+    seen_keys = set()
+    for group in action_groups:
+        for action in group or []:
+            label = str(action.get("label") or "").strip()
+            prompt = str(action.get("prompt") or "").strip()
+            mode = str(action.get("mode") or "evolve").strip()
+            reason = str(action.get("reason") or "").strip()
+            if not label or not prompt:
+                continue
+            key = (label.lower(), prompt.lower(), mode.lower())
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            merged.append({"label": label, "prompt": prompt, "mode": mode, "reason": reason})
+            if len(merged) >= limit:
+                return merged
+    return merged
+
+
 def build_project_memory(payload: ChatAgentRequest, app_type: str, builder_mode: str, systems: List[str], has_generated_app: bool, questions: List[str], suggested_actions: List[Dict[str, str]], research: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     previous_memory = dict(payload.project_memory or {})
     decisions = infer_decisions_from_message(payload.message, previous_memory)
@@ -990,37 +1294,115 @@ def build_project_memory(payload: ChatAgentRequest, app_type: str, builder_mode:
 def build_memory_summary(memory: Dict[str, Any]) -> str:
     systems = memory.get("systems") or []
     decisions = memory.get("decisions") or {}
-    system_line = ", ".join(systems[:4]) if systems else "base storage"
+    system_line = ", ".join(systems[:4]) if systems else "the basic app setup"
     unresolved = memory.get("unresolved_questions") or []
-    unresolved_line = f" Waiting on {len(unresolved)} clarification item(s)." if unresolved else ""
+    unresolved_line = f" I am still waiting on {len(unresolved)} detail(s)." if unresolved else ""
     decision_parts = []
     if decisions.get("auth_required") is True:
-        decision_parts.append("login required")
+        decision_parts.append("login is included")
     elif decisions.get("auth_required") is False:
-        decision_parts.append("open access")
+        decision_parts.append("no login yet")
     if decisions.get("billing_enabled") is True:
-        decision_parts.append("billing enabled")
+        decision_parts.append("billing is included")
     elif decisions.get("billing_enabled") is False:
-        decision_parts.append("no billing")
+        decision_parts.append("billing is not in v1")
     if decisions.get("product_shape"):
-        decision_parts.append(f"shape: {decisions['product_shape']}")
-    decision_line = f" Decisions: {', '.join(decision_parts)}." if decision_parts else ""
+        decision_parts.append(f"shape is {decisions['product_shape']}")
+    decision_line = f" Current choices: {', '.join(decision_parts)}." if decision_parts else ""
     advice = memory.get("advice") or {}
     advice_count = sum(len(advice.get(key) or []) for key in ["upgrades", "cautions", "better_options"])
-    advice_line = f" Advisor notes: {advice_count}." if advice_count else ""
+    advice_line = f" I have {advice_count} suggestion(s) ready." if advice_count else ""
     research = memory.get("latest_research") or {}
-    research_line = " Research saved." if research.get("findings") else ""
+    research_line = " Research is saved." if research.get("findings") else ""
     recommendation = memory.get("research_recommendation") or {}
-    recommendation_line = " Research recommendation ready." if recommendation.get("prompt") else ""
+    recommendation_line = " I already have a recommended next step." if recommendation.get("prompt") else ""
     knowledge_count = len(memory.get("knowledge_items") or [])
-    knowledge_line = f" Knowledge bank: {knowledge_count}." if knowledge_count else ""
+    knowledge_line = f" I saved {knowledge_count} helpful note(s)." if knowledge_count else ""
     global_knowledge_count = memory.get("global_knowledge_count") or 0
-    global_line = f" Global knowledge: {global_knowledge_count}." if global_knowledge_count else ""
+    global_line = f" Global knowledge items: {global_knowledge_count}." if global_knowledge_count else ""
     return (
-        f"Project type: {memory.get('app_type', 'tool app')}. "
-        f"Mode: {memory.get('builder_mode', 'general-builder')}. "
-        f"Systems: {system_line}.{decision_line}{advice_line}{research_line}{recommendation_line}{knowledge_line}{global_line}{unresolved_line}"
+        f"This looks like a {memory.get('app_type', 'tool app')} in {memory.get('builder_mode', 'general-builder')} mode. "
+        f"Right now I am tracking {system_line}.{decision_line}{advice_line}{research_line}{recommendation_line}{knowledge_line}{global_line}{unresolved_line}"
     )
+
+
+def build_status_summary(response_type: str, ready_to_apply: bool, apply_mode: str, question_count: int) -> str:
+    if response_type == "answer":
+        return "Answered. You can keep asking questions or apply a change when ready."
+    if response_type == "clarify":
+        if question_count:
+            return f"I need {question_count} quick detail(s) before I build the next step."
+        return "I need a little more detail before I build the next step."
+    if response_type == "suggest":
+        return "I shared a few good next-step ideas you can choose from."
+    if response_type == "research":
+        return "I checked the topic and saved a practical next step for you."
+    if response_type == "explain":
+        return "I explained the plan in simple terms."
+    if ready_to_apply:
+        return f"Ready to apply in {apply_mode} mode when you want."
+    return "You can keep talking or pick one of the quick actions."
+
+
+def shorten_chat_reply(message: str, max_sentences: int = 2) -> str:
+    text = str(message or "").strip()
+    if not text:
+        return ""
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    compact_parts = [part.strip() for part in parts if part.strip()]
+    if len(compact_parts) <= max_sentences:
+        return " ".join(compact_parts)
+    return " ".join(compact_parts[:max_sentences]).strip()
+
+
+def build_conversational_answer(
+    message: str,
+    app_type: str,
+    builder_mode: str,
+    systems: List[str],
+    has_generated_app: bool,
+    knowledge_hits: List[Dict[str, str]],
+    previous_memory: Dict[str, Any],
+    recent_messages: List[Dict[str, str]],
+) -> str:
+    lowered = message.lower()
+    system_line = ", ".join(systems[:4]) if systems else "core project systems"
+    unresolved = list(previous_memory.get("unresolved_questions") or [])
+    recent_context = summarize_recent_context(recent_messages)
+
+    if re.search(r"(conversation|chat|talk|answer|respond|question)", lowered):
+        answer = (
+            "Yes. You can talk to the builder normally. "
+            "It should answer first, ask follow-up questions when needed, and only apply changes when the request is clear."
+        )
+    elif re.search(r"(frontend|backend|full.?stack|api|database|server)", lowered):
+        answer = (
+            "Yes. I can talk through a full-stack change first, then target the frontend, the backend, or both. "
+            "If workspace editing is enabled, I can write into the configured repo. If not, I update the generated project bundle."
+        )
+    elif re.search(r"(remember|memory|saved|know about this project)", lowered):
+        answer = (
+            "I keep the main project context, like app type, builder mode, planned systems, research, and missing details, "
+            "so the conversation stays on the same project."
+        )
+    elif unresolved and re.search(r"(what do you need|what is missing|what else)", lowered):
+        answer = (
+            f"I am waiting on {len(unresolved)} detail(s) before I apply the next change. "
+            f"The first missing point is: {unresolved[0]}"
+        )
+    else:
+        answer = (
+            f"Right now I would treat this as a {app_type} in {builder_mode} mode. "
+            f"The main systems are {system_line}. "
+            "I can keep answering questions, or turn this into a change when you are ready."
+        )
+
+    if recent_context and len(message.split()) <= 5:
+        answer += f" Recent context: {recent_context}"
+
+    if knowledge_hits:
+        answer += f" I also found {len(knowledge_hits)} saved note(s) that support this answer."
+    return answer
 
 
 def build_agent_reply(payload: ChatAgentRequest) -> Dict[str, Any]:
@@ -1044,6 +1426,8 @@ def build_agent_reply(payload: ChatAgentRequest) -> Dict[str, Any]:
     global_knowledge_items = load_global_knowledge_store()
     combined_knowledge_items = merge_knowledge_items(list(previous_memory.get("knowledge_items") or []), global_knowledge_items, 48)
     knowledge_hits = find_relevant_knowledge(message, combined_knowledge_items)
+    reply_preference = normalize_reply_preference(payload.reply_preference)
+    recent_messages = list(payload.recent_messages or [])[-6:]
     if knowledge_hits:
         save_global_knowledge_store(mark_knowledge_usage(global_knowledge_items, knowledge_hits))
 
@@ -1063,7 +1447,7 @@ def build_agent_reply(payload: ChatAgentRequest) -> Dict[str, Any]:
             )
         assistant_message = summarize_research(research, app_type, builder_mode)
         if research_recommendation.get("prompt"):
-            assistant_message += f" My recommendation is {research_recommendation.get('label', 'the researched option')}. {research_recommendation.get('explanation', '')} I can also apply it now if you want."
+            assistant_message += f" I recommend {research_recommendation.get('label', 'the researched option')}. {research_recommendation.get('explanation', '')} I can apply it now if you want."
     elif research_recommendation.get("prompt") and is_affirmative(lowered) and not (previous_memory.get("unresolved_questions") or []):
         response_type = "apply"
         ready_to_apply = True
@@ -1079,27 +1463,40 @@ def build_agent_reply(payload: ChatAgentRequest) -> Dict[str, Any]:
         ready_to_apply = False
         assistant_message = (
             f"I recommend starting with a {app_type} in {builder_mode} mode. "
-            "A strong first version should include a clear homepage, a main workspace, saved data, and one focused upgrade path. "
-            "Pick one of the suggested actions, or tell me your niche and I will shape the first version for it."
+            "For v1, keep it focused: a clear homepage, one main workspace, saved data, and one useful upgrade path. "
+            "Pick a suggestion, or tell me your niche and I will shape it around that."
         )
         if knowledge_hits:
             assistant_message += f" I am also using {len(knowledge_hits)} saved knowledge item(s) from earlier research on similar topics."
-    elif is_explanation_request(lowered) and not is_mutation_request(lowered):
+    elif (is_explanation_request(lowered) or is_followup_question(message, recent_messages)) and not is_mutation_request(lowered):
         response_type = "explain"
         ready_to_apply = False
         system_line = ", ".join(systems[:4]) if systems else "storage"
         assistant_message = (
             f"Right now I would treat this as a {app_type} in {builder_mode} mode. "
             f"The main systems I would plan are {system_line}. "
-            "If you want, I can apply that plan now or narrow it into a simpler first version."
+            "If you want, I can apply that plan now or simplify it first."
         )
         if knowledge_hits:
             assistant_message += " I also found matching saved knowledge that can guide the choice below."
+    elif (is_question_message(message) or is_followup_question(message, recent_messages) or reply_preference == "answer") and not is_mutation_request(lowered) and not re.search(r"\b(build|create|make|start|generate)\b", lowered):
+        response_type = "answer"
+        ready_to_apply = False
+        assistant_message = build_conversational_answer(
+            message,
+            app_type,
+            builder_mode,
+            systems,
+            has_generated_app,
+            knowledge_hits,
+            previous_memory,
+            recent_messages,
+        )
     elif not has_generated_app and (vague_build or message in {"app", "website", "build me something", "build app"}):
         response_type = "clarify"
         ready_to_apply = False
         questions = build_clarifying_questions(lowered, app_type, systems, decisions)
-        assistant_message = "I can build that, but I need one or two details first so the first version is useful instead of generic."
+        assistant_message = "I can build that, but I need one or two details first so the first version is actually useful."
     elif has_generated_app and is_mutation_request(lowered):
         response_type = "apply"
         ready_to_apply = True
@@ -1123,12 +1520,17 @@ def build_agent_reply(payload: ChatAgentRequest) -> Dict[str, Any]:
             ready_to_apply = False
             questions = build_clarifying_questions(lowered, app_type, systems, decisions)
             assistant_message = "I can build the first version, but I need a little more direction so I choose the right screens and systems."
+        elif reply_preference == "clarify":
+            response_type = "clarify"
+            ready_to_apply = False
+            questions = build_clarifying_questions(lowered, app_type, systems, decisions)
+            assistant_message = "I understand the direction, but I will ask one or two questions first so the first version matches what you want."
         else:
             response_type = "apply"
             ready_to_apply = True
             apply_mode = "evolve"
-            assistant_message = "I understand the app direction and I am ready to build the first version now."
-    elif has_generated_app:
+            assistant_message = "I understand the direction and I am ready to build the first version now."
+    elif has_generated_app and reply_preference != "answer":
         response_type = "apply"
         ready_to_apply = True
         apply_mode = "mutate"
@@ -1140,6 +1542,11 @@ def build_agent_reply(payload: ChatAgentRequest) -> Dict[str, Any]:
         assistant_message = "Tell me a bit more about the app you want, and I will shape the first version with the right layout and systems."
 
     suggested_actions = build_suggested_actions(app_type, has_generated_app, systems, builder_mode, research_recommendation)
+    next_improvement_action = build_next_improvement_action(app_type, has_generated_app, systems, builder_mode, message, previous_memory)
+    followup_actions = build_followup_actions(response_type, has_generated_app)
+    suggested_actions = merge_action_lists([next_improvement_action], followup_actions, suggested_actions, limit=5)
+    if response_type in {"answer", "clarify", "suggest", "explain", "research"}:
+        assistant_message = shorten_chat_reply(assistant_message, 2)
     project_memory = build_project_memory(payload, app_type, builder_mode, systems, has_generated_app, questions, suggested_actions, research)
     advice = project_memory.get("advice") or {"upgrades": [], "cautions": [], "better_options": []}
 
@@ -1147,6 +1554,7 @@ def build_agent_reply(payload: ChatAgentRequest) -> Dict[str, Any]:
         "ok": True,
         "response_type": response_type,
         "assistant_message": assistant_message,
+        "status_summary": build_status_summary(response_type, ready_to_apply, apply_mode, len(questions)),
         "questions": questions,
         "suggested_actions": suggested_actions,
         "advice": advice,
@@ -2527,6 +2935,87 @@ def orchestrate(payload: OrchestrateRequest):
         },
         "summary": f"Orchestrated project {project_id} with {len(files)} files for a {app_type} in {builder_mode} mode.",
     }
+
+
+@app.post("/repo-edit")
+def repo_edit(payload: RepoEditRequest):
+    prompt = payload.prompt.strip()
+    decisions = infer_decisions_from_message(prompt, payload.project_memory or {})
+    app_type, builder_mode, systems, resolved_complexity = resolve_builder_state(
+        prompt,
+        payload.project_memory,
+        payload.feature_state,
+        payload.system_planner,
+        app_type=payload.app_type,
+        builder_mode=payload.builder_mode,
+        systems=payload.systems,
+    )
+    app_type, builder_mode = apply_decisions_to_product(app_type, builder_mode, decisions)
+    systems = apply_decisions_to_systems(systems, decisions)
+    complexity = payload.complexity or resolved_complexity or "product"
+    style = payload.style or "dark glass"
+    persistence = payload.persistence or infer_persistence(prompt, systems, complexity)
+    target_scope = normalize_repo_scope(payload.target_scope)
+    routes = build_routes(app_type, prompt, systems)
+    components = build_components(app_type, systems)
+    file_tree = build_file_tree(app_type, builder_mode, prompt, systems, persistence)
+    project_memory = build_generation_project_memory(prompt, payload.project_memory, app_type, builder_mode, systems, True)
+    project_memory["preferred_scope"] = "frontend-and-backend" if target_scope == "fullstack" else target_scope
+    project_memory["repo_edit_enabled"] = True
+
+    generated_files = generate_code_bundle(prompt, app_type, builder_mode, style, systems, persistence)
+    merged_files, changed_paths = merge_repo_edit_files(payload.current_files, generated_files, target_scope)
+
+    return {
+        "ok": True,
+        "prompt": prompt,
+        "app_type": app_type,
+        "builder_mode": builder_mode,
+        "systems": systems,
+        "complexity": complexity,
+        "persistence": persistence,
+        "target_scope": target_scope,
+        "routes": routes,
+        "components": components,
+        "file_tree": file_tree,
+        "generated_files": merged_files,
+        "files": merged_files,
+        "changed_files": changed_paths,
+        "changed_file_count": len(changed_paths),
+        "project_memory": project_memory,
+        "summary": f"Repo edit prepared {len(changed_paths)} {target_scope} file updates for a {app_type} in {builder_mode} mode.",
+    }
+
+
+@app.post("/workspace-edit")
+def workspace_edit(payload: WorkspaceEditRequest):
+    workspace_root = get_workspace_root()
+    if not workspace_root:
+        return {
+            "ok": False,
+            "error": "Workspace edit is not enabled. Set BUILDER_WORKSPACE_ROOT on the backend.",
+            "workspace_edit_enabled": False,
+        }
+
+    target_root = resolve_workspace_target(workspace_root, payload.workspace_subdir)
+    repo_result = repo_edit(payload)
+    if not repo_result.get("ok"):
+        return repo_result
+
+    write_result = write_workspace_files(target_root, repo_result.get("files") or [], repo_result.get("changed_files") or [])
+    repo_result["workspace_edit_enabled"] = True
+    repo_result["workspace_root_configured"] = True
+    repo_result["workspace_subdir"] = payload.workspace_subdir or ""
+    repo_result["written_files"] = write_result.get("written_files") or []
+    repo_result["written_file_count"] = len(repo_result["written_files"])
+    repo_result["backup_manifest"] = write_result.get("backup_manifest") or ""
+    repo_result["backup_entries"] = write_result.get("backup_entries") or []
+    repo_result["backup_count"] = int(write_result.get("backup_count") or 0)
+    repo_result["summary"] = (
+        f"Workspace edit wrote {repo_result['written_file_count']} files inside the configured workspace root "
+        f"for a {repo_result.get('app_type', 'project')} in {repo_result.get('builder_mode', 'builder')} mode."
+    )
+    return repo_result
 
 @app.post("/chat-agent")
 def chat_agent(payload: ChatAgentRequest):
