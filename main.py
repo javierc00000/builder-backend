@@ -65,6 +65,9 @@ class GenerateCodeRequest(BaseModel):
     complexity: str = "mvp"
     architecture: Dict[str, Any] = Field(default_factory=dict)
     persistence: str = ""
+    rv_template_key: str = "rv_power"
+    rv_camping_profile: str = "weekend"
+    monetization_config: Dict[str, Any] = Field(default_factory=dict)
 
 class RvMonetizationRequest(BaseModel):
     template_key: str = "rv_power"
@@ -129,6 +132,90 @@ def build_rv_monetization_plan(template_key: str, camping_profile: str, battery_
         ],
     }
 
+
+
+
+def monetization_data_code(plan: Dict[str, Any]) -> str:
+    plan_json = json.dumps(plan, indent=2)
+    return f"""
+export const monetizationPlan = {plan_json};
+
+export const featuredProducts = monetizationPlan.featuredProducts || [];
+export const paywallHooks = monetizationPlan.paywallHooks || [];
+""".strip()
+
+
+def monetization_panel_code() -> str:
+    return """
+import React from "react";
+import { monetizationPlan, featuredProducts, paywallHooks } from "../lib/monetization.js";
+
+export function MonetizationPanel() {
+  return (
+    <section className="panel monetization-panel">
+      <div className="module-top">
+        <div>
+          <div className="pill">Premium RV upgrade</div>
+          <h3 style={{ margin: "10px 0 6px" }}>{monetizationPlan.headline || "Upgrade your RV setup"}</h3>
+          <p className="muted">{monetizationPlan.subscription?.pitch || "Unlock deeper planning and premium RV help."}</p>
+        </div>
+        <div className="pricing-stack">
+          <div className="price-chip">${monetizationPlan.subscription?.monthlyPrice || 9.99}/mo</div>
+          <div className="price-chip">${monetizationPlan.subscription?.yearlyPrice || 69.99}/yr</div>
+          <div className="price-chip">{monetizationPlan.subscription?.trialDays || 7}-day trial</div>
+        </div>
+      </div>
+
+      <div className="card-grid" style={{ marginTop: 12 }}>
+        {paywallHooks.map((hook) => (
+          <div key={hook} className="card">
+            <strong>{hook}</strong>
+            <div className="muted" style={{ marginTop: 6 }}>Premium conversion hook included in this generated app.</div>
+          </div>
+        ))}
+      </div>
+
+      <div className="card-grid" style={{ marginTop: 12 }}>
+        {featuredProducts.map((item) => (
+          <div key={item.slug || item.title} className="card">
+            <strong>{item.title}</strong>
+            <div className="muted" style={{ marginTop: 6 }}>{item.fit}</div>
+            <div className="module-top" style={{ marginTop: 10 }}>
+              <span className="pill">{item.cta || "Affiliate-ready"}</span>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                <a className="pill" href={item.affiliateUrlCa} target="_blank" rel="noreferrer">Amazon.ca</a>
+                <a className="pill" href={item.affiliateUrlUs} target="_blank" rel="noreferrer">Amazon.com</a>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+""".strip()
+
+
+def monetization_styles_css() -> str:
+    return """
+.monetization-panel {
+  border-color: rgba(102, 217, 239, 0.22);
+  box-shadow: inset 0 0 0 1px rgba(102, 217, 239, 0.08);
+}
+.pricing-stack {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.price-chip {
+  border-radius: 999px;
+  padding: 10px 14px;
+  font-weight: 700;
+  color: #07111f;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+}
+""".strip()
 
 @app.post("/rv-monetization-plan")
 def rv_monetization_plan(payload: RvMonetizationRequest):
@@ -443,7 +530,7 @@ def build_mutation_summary(layout: Dict[str, Any], modules: List[str], app_type:
 
 
 def app_css(style_name: str) -> str:
-    return """
+    return ("""
 :root {
   color-scheme: dark;
   --bg: #07111f;
@@ -476,7 +563,7 @@ button, input, textarea { font: inherit; }
 .list { display: grid; gap: 10px; margin-top: 12px; }
 .item { display: flex; justify-content: space-between; gap: 12px; padding: 12px; border: 1px solid rgba(148,163,184,.12); border-radius: 12px; background: rgba(255,255,255,.03); }
 @media (max-width: 900px) { .row.two, .row.three { grid-template-columns: 1fr; } }
-""".strip()
+""" + "\n\n" + monetization_styles_css()).strip()
 
 
 def main_jsx() -> str:
@@ -545,6 +632,7 @@ export function DashboardPage() {{
         </div>
       </div>
       <InspectorPanel />
+      <MonetizationPanel />
     </div>
   );
 }}
@@ -607,6 +695,7 @@ export function StudioPage() {{
         <PreviewPanel value={{draft}} />
       </div>
       <NotesPanel />
+      <MonetizationPanel />
     </div>
   );
 }}
@@ -1285,7 +1374,7 @@ uvicorn main:app --reload --port 8000
 '''.strip()
 
 
-def generate_code_bundle(prompt: str, app_type: str, builder_mode: str, style: str, systems: List[str], persistence: str) -> List[Dict[str, Any]]:
+def generate_code_bundle(prompt: str, app_type: str, builder_mode: str, style: str, systems: List[str], persistence: str, monetization_plan: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     files = [
         {"path": "frontend/src/main.jsx", "language": "javascript", "content": main_jsx()},
         {"path": "frontend/src/App.jsx", "language": "javascript", "content": root_app_code(app_type)},
@@ -1298,6 +1387,12 @@ def generate_code_bundle(prompt: str, app_type: str, builder_mode: str, style: s
         {"path": "backend/.env.example", "language": "text", "content": backend_env_example_code(persistence)},
         {"path": "README.md", "language": "markdown", "content": readme_code(app_type, persistence, systems)},
     ]
+
+    if monetization_plan:
+        files += [
+            {"path": "frontend/src/lib/monetization.js", "language": "javascript", "content": monetization_data_code(monetization_plan)},
+            {"path": "frontend/src/components/MonetizationPanel.jsx", "language": "javascript", "content": monetization_panel_code()},
+        ]
 
     if app_type == "admin panel":
         files += [
@@ -1402,21 +1497,23 @@ def generate_code(payload: GenerateCodeRequest):
     complexity = payload.complexity or "mvp"
     persistence = payload.persistence or infer_persistence(prompt, systems, complexity)
 
-    files = generate_code_bundle(prompt, app_type, builder_mode, style, systems, persistence)
-    routes = payload.routes or build_routes(app_type, prompt, systems)
-    components = payload.components or build_components(app_type, systems)
-
+    monetization_config = payload.monetization_config or {}
+    template_key = payload.rv_template_key or ("rv_power" if builder_mode == "battery-planner" else "rv_diagnostics" if "ai-tools" in systems else "rv_maintenance")
+    camping_profile = payload.rv_camping_profile or "weekend"
     monetization = build_rv_monetization_plan(
-        "rv_power" if builder_mode == "battery-planner" else "rv_diagnostics" if "ai-tools" in systems else "rv_maintenance",
-        "weekend",
+        template_key,
+        camping_profile,
         180 if builder_mode == "battery-planner" else 120,
         400 if builder_mode == "battery-planner" else 220,
         2000 if builder_mode == "battery-planner" else 1500,
-        9.99,
-        69.99,
-        "rvinspector03-20",
-        "rvinspectorpr-20",
+        float(monetization_config.get("monthlyPrice", 9.99) or 9.99),
+        float(monetization_config.get("yearlyPrice", 69.99) or 69.99),
+        str(monetization_config.get("affiliateTagCa", "rvinspector03-20") or "rvinspector03-20"),
+        str(monetization_config.get("affiliateTagUs", "rvinspectorpr-20") or "rvinspectorpr-20"),
     )
+    files = generate_code_bundle(prompt, app_type, builder_mode, style, systems, persistence, monetization)
+    routes = payload.routes or build_routes(app_type, prompt, systems)
+    components = payload.components or build_components(app_type, systems)
 
     return {
         "ok": True,
@@ -1440,5 +1537,6 @@ def generate_code(payload: GenerateCodeRequest):
             "storage_file": "backend/data_store.py",
         },
         "monetization": monetization,
+        "monetization_wired": True,
         "summary": f"Generated {len(files)} files for a {app_type} in {builder_mode} mode with {persistence} persistence and live data flow.",
     }
