@@ -77,6 +77,8 @@ class MutateRequest(BaseModel):
     active_modules: List[str] = Field(default_factory=list)
     feature_state: Dict[str, Any] = Field(default_factory=dict)
     project_memory: Dict[str, Any] = Field(default_factory=dict)
+    system_planner: Dict[str, Any] = Field(default_factory=dict)
+    system_prompt: str = ""
     systems: List[str] = Field(default_factory=list)
     complexity: str = ""
     architecture: Dict[str, Any] = Field(default_factory=dict)
@@ -93,6 +95,9 @@ class GenerateCodeRequest(BaseModel):
     complexity: str = "mvp"
     architecture: Dict[str, Any] = Field(default_factory=dict)
     project_memory: Dict[str, Any] = Field(default_factory=dict)
+    feature_state: Dict[str, Any] = Field(default_factory=dict)
+    system_planner: Dict[str, Any] = Field(default_factory=dict)
+    system_prompt: str = ""
     persistence: str = ""
     rv_template_key: str = "rv_power"
     rv_camping_profile: str = "weekend"
@@ -861,6 +866,44 @@ def build_generation_project_memory(payload_prompt: str, project_memory: Dict[st
         "global_knowledge_count": global_knowledge_count,
         "unresolved_questions": [],
     }
+
+
+def resolve_builder_state(
+    prompt: str,
+    project_memory: Dict[str, Any],
+    feature_state: Optional[Dict[str, Any]] = None,
+    system_planner: Optional[Dict[str, Any]] = None,
+    app_type: str = "",
+    builder_mode: str = "",
+    systems: Optional[List[str]] = None,
+) -> tuple[str, str, List[str], str]:
+    feature_state = feature_state or {}
+    system_planner = system_planner or {}
+    previous_memory = project_memory or {}
+
+    resolved_app_type = (
+        app_type
+        or feature_state.get("appType")
+        or previous_memory.get("app_type")
+        or infer_app_type(prompt)
+    )
+    resolved_builder_mode = (
+        builder_mode
+        or feature_state.get("builderMode")
+        or previous_memory.get("builder_mode")
+        or infer_builder_mode(prompt)
+    )
+    resolved_systems = (
+        systems
+        or system_planner.get("systems")
+        or previous_memory.get("systems")
+        or infer_systems(prompt, resolved_app_type)
+    )
+    resolved_complexity = (
+        system_planner.get("complexity")
+        or "mvp"
+    )
+    return resolved_app_type, resolved_builder_mode, list(resolved_systems or []), resolved_complexity
 
 
 def build_project_id(raw_project_id: str) -> str:
@@ -2295,13 +2338,17 @@ def generate_code_bundle(prompt: str, app_type: str, builder_mode: str, style: s
 def mutate(payload: MutateRequest):
     prompt = payload.prompt.strip()
     decisions = infer_decisions_from_message(prompt, payload.project_memory or {})
-    app_type = payload.project_memory.get("app_type") or infer_app_type(prompt)
-    builder_mode = payload.project_memory.get("builder_mode") or infer_builder_mode(prompt)
+    app_type, builder_mode, systems, resolved_complexity = resolve_builder_state(
+        prompt,
+        payload.project_memory,
+        payload.feature_state,
+        payload.system_planner,
+        systems=payload.systems,
+    )
     app_type, builder_mode = apply_decisions_to_product(app_type, builder_mode, decisions)
     summary_style = infer_summary_style(prompt)
-    systems = payload.systems or payload.project_memory.get("systems") or infer_systems(prompt, app_type)
     systems = apply_decisions_to_systems(systems, decisions)
-    persistence = infer_persistence(prompt, systems, payload.complexity or "mvp")
+    persistence = infer_persistence(prompt, systems, payload.complexity or resolved_complexity)
     modules = recommend_modules(prompt, app_type)
     layout = build_layout(prompt, payload.current_layout)
     file_tree = build_file_tree(app_type, builder_mode, prompt, systems, persistence)
@@ -2338,13 +2385,19 @@ def mutate(payload: MutateRequest):
 def generate_code(payload: GenerateCodeRequest):
     prompt = payload.prompt.strip()
     decisions = infer_decisions_from_message(prompt, payload.project_memory or {})
-    app_type = payload.app_type or payload.project_memory.get("app_type") or infer_app_type(prompt)
-    builder_mode = payload.builder_mode or payload.project_memory.get("builder_mode") or infer_builder_mode(prompt)
+    app_type, builder_mode, systems, resolved_complexity = resolve_builder_state(
+        prompt,
+        payload.project_memory,
+        payload.feature_state,
+        payload.system_planner,
+        app_type=payload.app_type,
+        builder_mode=payload.builder_mode,
+        systems=payload.systems,
+    )
     app_type, builder_mode = apply_decisions_to_product(app_type, builder_mode, decisions)
-    systems = payload.systems or payload.project_memory.get("systems") or infer_systems(prompt, app_type)
     systems = apply_decisions_to_systems(systems, decisions)
     style = payload.style or "dark glass"
-    complexity = payload.complexity or "mvp"
+    complexity = payload.complexity or resolved_complexity or "mvp"
     persistence = payload.persistence or infer_persistence(prompt, systems, complexity)
     project_memory = build_generation_project_memory(prompt, payload.project_memory, app_type, builder_mode, systems, True)
 
@@ -2398,17 +2451,18 @@ def generate_code(payload: GenerateCodeRequest):
 def orchestrate(payload: OrchestrateRequest):
     prompt = payload.prompt.strip()
     decisions = infer_decisions_from_message(prompt, payload.project_memory or {})
-    app_type = payload.app_type or payload.project_memory.get("app_type") or infer_app_type(prompt)
-    builder_mode = payload.builder_mode or payload.project_memory.get("builder_mode") or infer_builder_mode(prompt)
-    app_type, builder_mode = apply_decisions_to_product(app_type, builder_mode, decisions)
-    systems = (
-        payload.systems
-        or payload.system_planner.get("systems")
-        or payload.project_memory.get("systems")
-        or infer_systems(prompt, app_type)
+    app_type, builder_mode, systems, resolved_complexity = resolve_builder_state(
+        prompt,
+        payload.project_memory,
+        payload.feature_state,
+        payload.system_planner,
+        app_type=payload.app_type,
+        builder_mode=payload.builder_mode,
+        systems=payload.systems,
     )
+    app_type, builder_mode = apply_decisions_to_product(app_type, builder_mode, decisions)
     systems = apply_decisions_to_systems(systems, decisions)
-    complexity = payload.complexity or payload.system_planner.get("complexity") or "mvp"
+    complexity = payload.complexity or resolved_complexity or "mvp"
     style = payload.style or "dark glass"
     persistence = payload.persistence or infer_persistence(prompt, systems, complexity)
     modules = recommend_modules(prompt, app_type)
