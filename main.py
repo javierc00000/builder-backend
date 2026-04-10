@@ -1124,6 +1124,8 @@ def build_clarifying_questions(message: str, app_type: str, systems: List[str], 
     if is_calculator_tool:
         if decisions.get("product_shape") is None:
             questions.append("Should this stay a simple calculator, or do you also want saved plans later?")
+        elif not re.search(r"(appliance|device|load|watts|hours)", message):
+            questions.append("Should users enter individual appliances, or just total power usage?")
         return questions[:1]
     if decisions.get("auth_required") is None and not re.search(r"(login|auth|account|sign in|signup|user)", message):
         questions.append("Should users sign in, or should this stay open to everyone?")
@@ -1136,6 +1138,7 @@ def build_clarifying_questions(message: str, app_type: str, systems: List[str], 
 
 def build_suggested_actions(app_type: str, has_generated_app: bool, systems: List[str], builder_mode: str, research_recommendation: Optional[Dict[str, str]] = None) -> List[Dict[str, str]]:
     actions: List[Dict[str, str]] = []
+    is_rv_calculator = app_type == "tool app" and builder_mode == "battery-planner"
     if research_recommendation and research_recommendation.get("prompt"):
         actions.append({
             "label": research_recommendation.get("label") or "Apply researched recommendation",
@@ -1149,19 +1152,29 @@ def build_suggested_actions(app_type: str, has_generated_app: bool, systems: Lis
             "admin panel": "Build an admin dashboard with login, sidebar, analytics cards, and settings",
             "content app": "Build a content studio with editor, preview, saved drafts, and notes",
         }.get(app_type, "Build a web app with homepage, dashboard, login, and saved data")
+        if is_rv_calculator:
+            starter_prompt = "Build an RV solar and battery calculator with appliance inputs, runtime estimates, inverter sizing, and simple result cards"
         actions.append({"label": "Build first version", "prompt": starter_prompt, "mode": "evolve"})
 
     if has_generated_app:
-        actions.append({"label": "Add login", "prompt": "Add login, protected routes, and account state", "mode": "mutate"})
-        actions.append({"label": "Improve mobile", "prompt": "Make the current app mobile friendly with cleaner spacing and navigation", "mode": "mutate"})
+        if is_rv_calculator:
+            actions.append({"label": "Add saved plans", "prompt": "Add saved RV plans and history so users can keep past calculations", "mode": "mutate"})
+            actions.append({"label": "Add PDF report", "prompt": "Add a printable report for solar, battery, and inverter sizing results", "mode": "mutate"})
+            actions.append({"label": "Add appliance presets", "prompt": "Add common RV appliance presets with default watts and hours", "mode": "mutate"})
+        else:
+            actions.append({"label": "Add login", "prompt": "Add login, protected routes, and account state", "mode": "mutate"})
+            actions.append({"label": "Improve mobile", "prompt": "Make the current app mobile friendly with cleaner spacing and navigation", "mode": "mutate"})
     else:
-        actions.append({"label": "SaaS starter", "prompt": "Build a SaaS web app with landing page, login, dashboard, billing, and settings", "mode": "evolve"})
+        if is_rv_calculator:
+            actions.append({"label": "Add saved plans later", "prompt": "Keep it simple first, then add saved RV plans and history later", "mode": "evolve"})
+        else:
+            actions.append({"label": "SaaS starter", "prompt": "Build a SaaS web app with landing page, login, dashboard, billing, and settings", "mode": "evolve"})
 
-    if app_type != "assistant app":
+    if app_type != "assistant app" and not is_rv_calculator:
         actions.append({"label": "AI assistant mode", "prompt": "Turn this into an AI assistant app with chat, tools, saved history, and a dashboard", "mode": "evolve" if not has_generated_app else "mutate"})
-    if "billing" not in systems:
+    if "billing" not in systems and not is_rv_calculator:
         actions.append({"label": "Add billing", "prompt": "Add billing, pricing, and a paid plan upgrade flow", "mode": "mutate" if has_generated_app else "evolve"})
-    if builder_mode != "site-builder":
+    if builder_mode != "site-builder" and not is_rv_calculator:
         actions.append({"label": "Marketing page", "prompt": "Add a premium landing page and stronger marketing sections", "mode": "mutate" if has_generated_app else "evolve"})
 
     return actions[:4]
@@ -1204,17 +1217,35 @@ def build_next_improvement_action(
 ) -> Dict[str, str]:
     previous_memory = previous_memory or {}
     decisions = dict(previous_memory.get("decisions") or {})
+    is_rv_calculator = app_type == "tool app" and builder_mode == "battery-planner"
     if not has_generated_app:
         starter_prompt = {
             "assistant app": "Build a simple AI assistant with chat, saved history, and one clean workspace",
             "admin panel": "Build a simple admin dashboard with login, sidebar, and key overview cards",
             "content app": "Build a simple content studio with editor, preview, and saved drafts",
         }.get(app_type, "Build a simple first version with one main screen, saved data, and a clear next step")
+        if is_rv_calculator:
+            starter_prompt = "Build a simple RV power calculator with appliance inputs, solar sizing, battery runtime, and inverter sizing"
         return {
             "label": "Best next improvement",
-            "reason": personalize_improvement_reason("Start with one focused first version before adding extra features.", message, previous_memory),
+            "reason": personalize_improvement_reason("Start with the core RV calculator first so users can size solar, battery, and inverter power right away.", message, previous_memory) if is_rv_calculator else personalize_improvement_reason("Start with one focused first version before adding extra features.", message, previous_memory),
             "prompt": starter_prompt,
             "mode": "evolve",
+        }
+
+    if is_rv_calculator and "storage" in systems:
+        return {
+            "label": "Best next improvement",
+            "reason": personalize_improvement_reason("Saved plans are the strongest next step because people often compare multiple RV setups before buying parts.", message, previous_memory),
+            "prompt": "Add saved RV plans and history so users can compare multiple solar and battery setups",
+            "mode": "mutate",
+        }
+    if is_rv_calculator:
+        return {
+            "label": "Best next improvement",
+            "reason": personalize_improvement_reason("Appliance presets make the calculator feel smarter and faster for RV owners.", message, previous_memory),
+            "prompt": "Add common RV appliance presets with default watts, hours, and quick-add controls",
+            "mode": has_generated_app and "mutate" or "evolve",
         }
 
     if "auth" not in systems and app_type in {"assistant app", "admin panel", "content app"} and decisions.get("auth_required") is not False:
@@ -1396,6 +1427,11 @@ def build_conversational_answer(
             f"I am waiting on {len(unresolved)} detail(s) before I apply the next change. "
             f"The first missing point is: {unresolved[0]}"
         )
+    elif app_type == "tool app" and builder_mode == "battery-planner":
+        answer = (
+            "I understand this as an RV power calculator. "
+            "The smart core is appliance inputs, solar sizing, battery runtime, and inverter sizing in one simple flow."
+        )
     else:
         answer = (
             f"Right now I would treat this as a {app_type} in {builder_mode} mode. "
@@ -1481,11 +1517,17 @@ def build_agent_reply(payload: ChatAgentRequest) -> Dict[str, Any]:
         response_type = "explain"
         ready_to_apply = False
         system_line = ", ".join(systems[:4]) if systems else "storage"
-        assistant_message = (
-            f"Right now I would treat this as a {app_type} in {builder_mode} mode. "
-            f"The main systems I would plan are {system_line}. "
-            "If you want, I can apply that plan now or simplify it first."
-        )
+        if app_type == "tool app" and builder_mode == "battery-planner":
+            assistant_message = (
+                "Right now I would treat this as an RV solar and battery calculator. "
+                "The main flow should be appliance inputs, battery runtime, solar sizing, and inverter sizing, then optional saved plans later."
+            )
+        else:
+            assistant_message = (
+                f"Right now I would treat this as a {app_type} in {builder_mode} mode. "
+                f"The main systems I would plan are {system_line}. "
+                "If you want, I can apply that plan now or simplify it first."
+            )
         if knowledge_hits:
             assistant_message += " I also found matching saved knowledge that can guide the choice below."
     elif (is_question_message(message) or is_followup_question(message, recent_messages) or reply_preference == "answer") and not is_mutation_request(lowered) and not re.search(r"\b(build|create|make|start|generate)\b", lowered):
