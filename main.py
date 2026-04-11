@@ -457,6 +457,49 @@ def is_explanation_request(message: str) -> bool:
     return bool(re.search(r"(why|how does|how do|what is|explain|walk me through|show me what|can it|can you|could you|does it|will it|is it able)", message))
 
 
+def is_greeting_message(message: str) -> bool:
+    return bool(re.fullmatch(r"\s*(hi|hello|hey|good morning|good afternoon|good evening|yo)\s*[!.?]*\s*", str(message or "").lower()))
+
+
+def is_gratitude_message(message: str) -> bool:
+    return bool(re.fullmatch(r"\s*(thanks|thank you|thx|perfect|great thanks|nice thanks)\s*[!.?]*\s*", str(message or "").lower()))
+
+
+def is_correction_message(message: str) -> bool:
+    return bool(re.search(r"(not what i meant|that is wrong|wrong app|not this app|different thing|something else|stop repeating|you keep answering|you keep talking about|completely different)", str(message or "").lower()))
+
+
+def last_message_for_role(recent_messages: List[Dict[str, str]], role: str) -> str:
+    target_role = str(role or "").strip().lower()
+    for item in reversed(recent_messages or []):
+        item_role = str(item.get("role") or "").strip().lower()
+        text = str(item.get("text") or "").strip()
+        if item_role == target_role and text:
+            return text
+    return ""
+
+
+def build_relational_reply(message: str, recent_messages: List[Dict[str, str]], previous_memory: Dict[str, Any]) -> str:
+    lowered = str(message or "").strip().lower()
+    last_user_topic = last_message_for_role(recent_messages, "user")
+    if is_greeting_message(lowered):
+        return "Hi. Tell me what you want to build, change, or figure out, and I will stay on that topic."
+    if is_gratitude_message(lowered):
+        return "You’re welcome. Tell me the next thing you want, and I’ll keep going with you."
+    if is_correction_message(lowered):
+        return "You’re right. I was leaning on the old context too much. Tell me the new thing you mean, and I’ll treat it as a fresh topic."
+    if re.fullmatch(r"\s*(ok|okay|sure|alright|fine)\s*[!.?]*\s*", lowered):
+        return "Okay. Tell me the next part you want me to focus on."
+    if re.fullmatch(r"\s*(yes|yeah|yep|go on|continue|keep going)\s*[!.?]*\s*", lowered):
+        return "Great. I can keep going. Tell me if you want ideas, risks, or a concrete change next."
+    if len(lowered.split()) <= 4 and last_user_topic:
+        return f"I’m with you. If you mean '{last_user_topic[:80]}', I can keep going from there, or we can switch topics."
+    project_summary = str(previous_memory.get("project_summary") or "").strip()
+    if project_summary:
+        return f"I’m following you. If you want to stay on '{project_summary[:80]}', I can keep going, or you can switch to something new."
+    return "I’m here with you. Tell me what you want to change or ask next, and I’ll respond directly to that."
+
+
 def is_question_message(message: str) -> bool:
     stripped = str(message or "").strip()
     if not stripped:
@@ -1589,7 +1632,7 @@ def build_conversational_answer(
     lowered = message.lower()
     system_line = ", ".join(systems[:4]) if systems else "core project systems"
     unresolved = list(previous_memory.get("unresolved_questions") or [])
-    recent_context = summarize_recent_context(recent_messages)
+    last_user_topic = last_message_for_role(recent_messages, "user")
     problem_request = is_problem_request(lowered)
     idea_request = is_idea_request(lowered)
 
@@ -1654,8 +1697,8 @@ def build_conversational_answer(
                 "I can keep answering questions, or turn that into a change when you are ready."
             )
 
-    if recent_context and len(message.split()) <= 5:
-        answer += f" Recent context: {recent_context}"
+    if last_user_topic and len(message.split()) <= 5 and last_user_topic.strip().lower() != lowered:
+        answer += f" I’m still following your last point about '{last_user_topic[:80]}'."
 
     if knowledge_hits:
         answer += f" I also found {len(knowledge_hits)} saved note(s) that support this answer."
@@ -1700,7 +1743,15 @@ def build_agent_reply(payload: ChatAgentRequest) -> Dict[str, Any]:
         save_global_knowledge_store(mark_knowledge_usage(global_knowledge_items, knowledge_hits))
 
     vague_build = bool(re.search(r"\b(app|website|web app|platform|tool)\b", lowered)) and len(message.split()) < 7
-    if needs_research(lowered):
+    if is_greeting_message(lowered) or is_gratitude_message(lowered) or is_correction_message(lowered):
+        response_type = "answer"
+        ready_to_apply = False
+        assistant_message = build_relational_reply(message, recent_messages, previous_memory)
+    elif len(lowered.split()) <= 4 and not is_mutation_request(lowered) and not needs_research(lowered):
+        response_type = "answer"
+        ready_to_apply = False
+        assistant_message = build_relational_reply(message, recent_messages, previous_memory)
+    elif needs_research(lowered):
         response_type = "research"
         ready_to_apply = False
         research = run_research(build_research_query(message, app_type, builder_mode))
