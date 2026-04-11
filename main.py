@@ -397,6 +397,14 @@ def is_builder_ai_request(message: str) -> bool:
     return bool(re.search(r"(this ai|the ai|builder ai|builder itself|my builder|this builder|copilot|chat ui|builder ui)", message))
 
 
+def is_problem_request(message: str) -> bool:
+    return bool(re.search(r"(problem|issue|wrong|bad|weak|bug|broken|risk|risks|watch out|concern|concerns)", message))
+
+
+def is_idea_request(message: str) -> bool:
+    return bool(re.search(r"(suggest|recommend|idea|ideas|what should|what can|help me choose|best option|next step)", message))
+
+
 def is_explanation_request(message: str) -> bool:
     return bool(re.search(r"(why|how does|how do|what is|explain|walk me through|show me what|can it|can you|could you|does it|will it|is it able)", message))
 
@@ -467,7 +475,7 @@ def is_mutation_request(message: str) -> bool:
 
 
 def needs_research(message: str) -> bool:
-    return bool(re.search(r"(research|search|look up|find information|find info|documentation|docs|latest|compare|comparison|best library|best package|which library|which package|sdk|integration guide|api docs)", message))
+    return bool(re.search(r"(research|search|look up|find information|find info|documentation|docs|compare|comparison|best library|best package|which library|which package|sdk|integration guide|api docs|latest (library|package|sdk|api|docs|documentation|integration))", message))
 
 
 def is_affirmative(message: str) -> bool:
@@ -1433,19 +1441,19 @@ def build_memory_summary(memory: Dict[str, Any]) -> str:
 
 def build_status_summary(response_type: str, ready_to_apply: bool, apply_mode: str, question_count: int) -> str:
     if response_type == "answer":
-        return "Answered. You can keep asking questions or apply a change when ready."
+        return "I answered your question. You can keep going or ask me to apply a change."
     if response_type == "clarify":
         if question_count:
             return f"I need {question_count} quick detail(s) before I build the next step."
-        return "I need a little more detail before I build the next step."
+        return "I need a little more detail before I continue."
     if response_type == "suggest":
-        return "I shared a few good next-step ideas you can choose from."
+        return "I shared a few next-step ideas you can choose from."
     if response_type == "research":
-        return "I checked the topic and saved a practical next step for you."
+        return "I checked that topic and saved a practical next step for you."
     if response_type == "explain":
         return "I explained the plan in simple terms."
     if ready_to_apply:
-        return f"Ready to apply in {apply_mode} mode when you want."
+        return f"I am ready to apply this in {apply_mode} mode when you want."
     return "You can keep talking or pick one of the quick actions."
 
 
@@ -1474,26 +1482,39 @@ def build_conversational_answer(
     system_line = ", ".join(systems[:4]) if systems else "core project systems"
     unresolved = list(previous_memory.get("unresolved_questions") or [])
     recent_context = summarize_recent_context(recent_messages)
+    problem_request = is_problem_request(lowered)
+    idea_request = is_idea_request(lowered)
 
     if is_builder_ai_request(lowered):
-        answer = (
-            "If you are asking about this builder AI itself, the main fix is to make it respond to the latest request first instead of repeating old app context. "
-            "It should also separate builder-improvement advice from app-feature advice."
-        )
+        if problem_request:
+            answer = (
+                "The biggest problem is that this AI can fall back to older project context too easily. "
+                "It should focus on your latest request first and keep builder advice separate from app feature suggestions."
+            )
+        elif idea_request:
+            answer = (
+                "A good next move is to make this AI react to the latest request first. "
+                "After that, it should explain likely problems clearly and give more specific next steps."
+            )
+        else:
+            answer = (
+                "The main fix is to make this AI respond to your latest request first, instead of repeating older app context. "
+                "It should also keep builder improvements separate from app feature suggestions."
+            )
     elif re.search(r"(conversation|chat|talk|answer|respond|question)", lowered):
         answer = (
             "Yes. You can talk to the builder normally. "
-            "It should answer first, ask follow-up questions when needed, and only apply changes when the request is clear."
+            "It should answer first, ask follow-up questions when needed, and only make changes when your request is clear."
         )
     elif re.search(r"(frontend|backend|full.?stack|api|database|server)", lowered):
         answer = (
-            "Yes. I can talk through a full-stack change first, then target the frontend, the backend, or both. "
-            "If workspace editing is enabled, I can write into the configured repo. If not, I update the generated project bundle."
+            "Yes. I can help with frontend, backend, or both. "
+            "If workspace editing is enabled, I can write into the repo. If not, I update the generated project bundle."
         )
     elif re.search(r"(remember|memory|saved|know about this project)", lowered):
         answer = (
             "I keep the main project context, like app type, builder mode, planned systems, research, and missing details, "
-            "so the conversation stays on the same project."
+            "so we stay on the same project."
         )
     elif unresolved and re.search(r"(what do you need|what is missing|what else)", lowered):
         answer = (
@@ -1506,11 +1527,24 @@ def build_conversational_answer(
             "The smart core is appliance inputs, solar sizing, battery runtime, and inverter sizing in one simple flow."
         )
     else:
-        answer = (
-            f"Right now I would treat this as a {app_type} in {builder_mode} mode. "
-            f"The main systems are {system_line}. "
-            "I can keep answering questions, or turn this into a change when you are ready."
-        )
+        if problem_request:
+            answer = (
+                f"The main risk I see is trying to make this {app_type} do too much at once. "
+                f"The core pieces are {system_line}. "
+                "I would keep those clear before adding more features."
+            )
+        elif idea_request:
+            answer = (
+                f"A strong direction is a {app_type} in {builder_mode} mode. "
+                f"The core pieces are {system_line}. "
+                "From there, I can suggest the best next step or turn it into a change."
+            )
+        else:
+            answer = (
+                f"This feels like a {app_type} in {builder_mode} mode. "
+                f"The main pieces are {system_line}. "
+                "I can keep answering questions, or turn that into a change when you are ready."
+            )
 
     if recent_context and len(message.split()) <= 5:
         answer += f" Recent context: {recent_context}"
@@ -1524,6 +1558,8 @@ def build_agent_reply(payload: ChatAgentRequest) -> Dict[str, Any]:
     message = payload.message.strip()
     lowered = message.lower()
     builder_ai_request = is_builder_ai_request(message)
+    problem_request = is_problem_request(message)
+    idea_request = is_idea_request(message)
     has_generated_app = bool(payload.generated_files or payload.routes or payload.components or payload.project_id)
     previous_memory = dict(payload.project_memory or {})
     decisions = infer_decisions_from_message(message, previous_memory)
@@ -1581,16 +1617,28 @@ def build_agent_reply(payload: ChatAgentRequest) -> Dict[str, Any]:
         response_type = "suggest"
         ready_to_apply = False
         if builder_ai_request:
-            assistant_message = (
-                "The repeated answer is happening because suggestion requests are still leaning on older project context too much. "
-                "The best fixes are reacting to the latest request first, separating builder advice from app advice, and checking for likely problems before suggesting generic features."
-            )
+            if problem_request:
+                assistant_message = (
+                    "The biggest problems right now are repeated replies and old project context taking over. "
+                    "I would fix that by making the AI react to the latest request first and by separating builder advice from app advice."
+                )
+            else:
+                assistant_message = (
+                    "A good next step is to make the AI react to the latest request first. "
+                    "After that, it should keep builder advice separate from app advice and check for likely problems before suggesting generic features."
+                )
         else:
-            assistant_message = (
-                f"I recommend starting with a {app_type} in {builder_mode} mode. "
-                "For v1, keep it focused: a clear homepage, one main workspace, saved data, and one useful upgrade path. "
-                "Pick a suggestion, or tell me your niche and I will shape it around that."
-            )
+            if problem_request:
+                assistant_message = (
+                    f"The main risk with this {app_type} idea is trying to pack too much into v1. "
+                    "I would keep the first version focused on one clear main screen, saved data, and one useful next step."
+                )
+            else:
+                assistant_message = (
+                    f"A good starting point is a {app_type} in {builder_mode} mode. "
+                    "For v1, keep it focused: one clear main screen, saved data, and one useful next step. "
+                    "Pick a suggestion, or tell me your niche and I will shape it around that."
+                )
         if knowledge_hits:
             assistant_message += f" I am also using {len(knowledge_hits)} saved knowledge item(s) from earlier research on similar topics."
     elif (is_explanation_request(lowered) or is_followup_question(message, recent_messages)) and not is_mutation_request(lowered):
@@ -1599,15 +1647,21 @@ def build_agent_reply(payload: ChatAgentRequest) -> Dict[str, Any]:
         system_line = ", ".join(systems[:4]) if systems else "storage"
         if app_type == "tool app" and builder_mode == "battery-planner":
             assistant_message = (
-                "Right now I would treat this as an RV solar and battery calculator. "
+                "This looks most like an RV solar and battery calculator. "
                 "The main flow should be appliance inputs, battery runtime, solar sizing, and inverter sizing, then optional saved plans later."
             )
         else:
-            assistant_message = (
-                f"Right now I would treat this as a {app_type} in {builder_mode} mode. "
-                f"The main systems I would plan are {system_line}. "
-                "If you want, I can apply that plan now or simplify it first."
-            )
+            if problem_request:
+                assistant_message = (
+                    f"The main things I would check first are {system_line}. "
+                    f"That is where this {app_type} could get messy if we overcomplicate it too early."
+                )
+            else:
+                assistant_message = (
+                    f"At this point, it looks like a {app_type} in {builder_mode} mode. "
+                    f"I would plan around {system_line}. "
+                    "If you want, I can apply that plan now or simplify it first."
+                )
         if knowledge_hits:
             assistant_message += " I also found matching saved knowledge that can guide the choice below."
     elif (is_question_message(message) or is_followup_question(message, recent_messages) or reply_preference == "answer") and not is_mutation_request(lowered) and not re.search(r"\b(build|create|make|start|generate)\b", lowered):
@@ -1632,7 +1686,7 @@ def build_agent_reply(payload: ChatAgentRequest) -> Dict[str, Any]:
         response_type = "apply"
         ready_to_apply = True
         apply_mode = "mutate"
-        assistant_message = "I understand the change and I am ready to apply it to the current project now."
+        assistant_message = "I can make that change in the current project now."
     elif not has_generated_app and re.search(r"(build|create|make|start|generate)", lowered):
         detail_score = sum(
             1
@@ -1660,7 +1714,7 @@ def build_agent_reply(payload: ChatAgentRequest) -> Dict[str, Any]:
             response_type = "apply"
             ready_to_apply = True
             apply_mode = "evolve"
-            assistant_message = "I understand the direction and I am ready to build the first version now."
+            assistant_message = "I have enough direction to build the first version now."
     elif has_generated_app and reply_preference != "answer":
         response_type = "apply"
         ready_to_apply = True
