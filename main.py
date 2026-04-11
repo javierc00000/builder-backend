@@ -16,6 +16,7 @@ except Exception:
 app = FastAPI(title="Builder Backend v6 - Data Flow Generator")
 
 KNOWLEDGE_STORE_PATH = Path(__file__).with_name("builder_knowledge_store.json")
+PROJECT_STORE_PATH = Path(__file__).with_name("builder_project_store.json")
 
 app.add_middleware(
     CORSMiddleware,
@@ -61,6 +62,49 @@ def knowledge_store(limit: int = 12):
         "count": len(items),
         "items": items[: max(1, min(limit, 50))],
         "top_topics": topics[:8],
+    }
+
+
+@app.get("/project-state/{project_id}")
+def get_project_state(project_id: str):
+    snapshot = load_project_snapshot(project_id)
+    return {
+        "ok": bool(snapshot),
+        "project_id": str(project_id or "").strip(),
+        "snapshot": snapshot,
+    }
+
+
+@app.get("/project-states")
+def list_project_states(limit: int = 20):
+    store = load_project_store()
+    items: List[Dict[str, Any]] = []
+    for project_id, snapshot in store.items():
+        if not isinstance(snapshot, dict):
+            continue
+        items.append({
+            "project_id": project_id,
+            "saved_at": snapshot.get("saved_at") or "",
+            "project_summary": snapshot.get("current_prompt") or snapshot.get("project_summary") or "",
+            "app_type": snapshot.get("feature_state", {}).get("appType") or snapshot.get("builder_project_memory", {}).get("app_type") or "",
+            "builder_mode": snapshot.get("feature_state", {}).get("builderMode") or snapshot.get("builder_project_memory", {}).get("builder_mode") or "",
+        })
+    items.sort(key=lambda item: str(item.get("saved_at") or ""), reverse=True)
+    capped = max(1, min(limit, 50))
+    return {
+        "ok": True,
+        "count": len(items),
+        "items": items[:capped],
+    }
+
+
+@app.put("/project-state/{project_id}")
+def put_project_state(project_id: str, payload: ProjectStateRequest):
+    snapshot = save_project_snapshot(project_id, payload.snapshot)
+    return {
+        "ok": bool(snapshot),
+        "project_id": str(project_id or "").strip(),
+        "saved_at": snapshot.get("saved_at") if snapshot else None,
     }
 
 
@@ -168,6 +212,10 @@ class RepoEditRequest(BaseModel):
 
 class WorkspaceEditRequest(RepoEditRequest):
     workspace_subdir: str = ""
+
+
+class ProjectStateRequest(BaseModel):
+    snapshot: Dict[str, Any] = Field(default_factory=dict)
 
 class RvMonetizationRequest(BaseModel):
     template_key: str = "rv_power"
@@ -947,6 +995,44 @@ def save_global_knowledge_store(items: List[Dict[str, str]]) -> None:
         KNOWLEDGE_STORE_PATH.write_text(json.dumps(sort_knowledge_items(items), indent=2), encoding="utf-8")
     except Exception:
         return
+
+
+def load_project_store() -> Dict[str, Any]:
+    try:
+        if not PROJECT_STORE_PATH.exists():
+            return {}
+        data = json.loads(PROJECT_STORE_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_project_store(items: Dict[str, Any]) -> None:
+    try:
+        PROJECT_STORE_PATH.write_text(json.dumps(items, indent=2), encoding="utf-8")
+    except Exception:
+        return
+
+
+def save_project_snapshot(project_id: str, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    cleaned = str(project_id or "").strip()
+    if not cleaned:
+        return {}
+    store = load_project_store()
+    payload = dict(snapshot or {})
+    payload["project_id"] = cleaned
+    payload["saved_at"] = datetime.now(timezone.utc).isoformat()
+    store[cleaned] = payload
+    save_project_store(store)
+    return payload
+
+
+def load_project_snapshot(project_id: str) -> Optional[Dict[str, Any]]:
+    cleaned = str(project_id or "").strip()
+    if not cleaned:
+        return None
+    snapshot = load_project_store().get(cleaned)
+    return snapshot if isinstance(snapshot, dict) else None
 
 
 def merge_knowledge_items(existing: List[Dict[str, str]], additions: List[Dict[str, str]], max_items: int) -> List[Dict[str, str]]:
