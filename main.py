@@ -393,6 +393,10 @@ def is_suggestion_request(message: str) -> bool:
     return bool(re.search(r"(suggest|recommend|idea|ideas|what should|what can|help me choose|best option)", message))
 
 
+def is_builder_ai_request(message: str) -> bool:
+    return bool(re.search(r"(this ai|the ai|builder ai|builder itself|my builder|this builder|copilot|chat ui|builder ui)", message))
+
+
 def is_explanation_request(message: str) -> bool:
     return bool(re.search(r"(why|how does|how do|what is|explain|walk me through|show me what|can it|can you|could you|does it|will it|is it able)", message))
 
@@ -1032,6 +1036,7 @@ def build_project_advice(
     better_options: List[Dict[str, str]] = []
     is_calculator_tool = app_type == "tool app" and builder_mode == "battery-planner"
     context_text = " ".join(part for part in [str(message or "").strip(), str(project_summary or "").strip()] if part).lower()
+    builder_ai_request = is_builder_ai_request(context_text)
     focus_count = sum(
         1
         for matched in [
@@ -1043,6 +1048,18 @@ def build_project_advice(
         ]
         if matched
     )
+
+    if builder_ai_request:
+        upgrades.append({"label": "Make replies react to the latest request", "reason": "The builder should answer what you just asked instead of repeating older project assumptions."})
+        upgrades.append({"label": "Separate builder advice from app advice", "reason": "Questions about this AI should lead to builder improvements, not generic app ideas like login or billing."})
+        cautions.append({"label": "Repeated canned replies", "reason": "If suggestion prompts always follow the same generic branch, the chat feels repetitive and less useful."})
+        cautions.append({"label": "Old project context takes over", "reason": "The current app context can overpower your latest request, so the answer no longer matches what you typed."})
+        better_options.append({"label": "Use builder-specific suggestion mode", "reason": "Requests about the AI or builder should produce conversation, preview, and UI improvements first."})
+        return {
+            "upgrades": upgrades[:3],
+            "cautions": cautions[:3],
+            "better_options": better_options[:3],
+        }
 
     if "auth" not in systems and app_type in {"admin panel", "assistant app"}:
         upgrades.append({"label": "Add login", "reason": "Protected workspaces usually need accounts, saved state, and project ownership."})
@@ -1172,15 +1189,23 @@ def build_clarifying_questions(message: str, app_type: str, systems: List[str], 
     return questions[:1]
 
 
-def build_suggested_actions(app_type: str, has_generated_app: bool, systems: List[str], builder_mode: str, research_recommendation: Optional[Dict[str, str]] = None) -> List[Dict[str, str]]:
+def build_suggested_actions(app_type: str, has_generated_app: bool, systems: List[str], builder_mode: str, research_recommendation: Optional[Dict[str, str]] = None, message: str = "") -> List[Dict[str, str]]:
     actions: List[Dict[str, str]] = []
     is_rv_calculator = app_type == "tool app" and builder_mode == "battery-planner"
+    builder_ai_request = is_builder_ai_request(message)
     if research_recommendation and research_recommendation.get("prompt"):
         actions.append({
             "label": research_recommendation.get("label") or "Apply researched recommendation",
             "prompt": research_recommendation.get("prompt") or "",
             "mode": research_recommendation.get("mode") or ("mutate" if has_generated_app else "evolve"),
         })
+
+    if builder_ai_request:
+        actions.append({"label": "Make replies less repetitive", "prompt": "improve this builder ai so replies use the latest request and stop repeating the same answer", "mode": "mutate" if has_generated_app else "evolve"})
+        actions.append({"label": "Show clearer problem checks", "prompt": "improve this builder ai so it spots possible problems first and explains them in simple language", "mode": "mutate" if has_generated_app else "evolve"})
+        actions.append({"label": "Improve preview flow", "prompt": "improve this builder ui and make the preview larger and more useful while chatting", "mode": "mutate" if has_generated_app else "evolve"})
+        actions.append({"label": "Give smarter next steps", "prompt": "improve this builder ai so next-step suggestions match the user request instead of generic app ideas", "mode": "mutate" if has_generated_app else "evolve"})
+        return actions[:4]
 
     if not has_generated_app:
         starter_prompt = {
@@ -1254,6 +1279,13 @@ def build_next_improvement_action(
     previous_memory = previous_memory or {}
     decisions = dict(previous_memory.get("decisions") or {})
     is_rv_calculator = app_type == "tool app" and builder_mode == "battery-planner"
+    if is_builder_ai_request(message):
+        return {
+            "label": "Best next improvement",
+            "reason": personalize_improvement_reason("Make the builder answer from the latest request first so it stops sounding repetitive.", message, previous_memory),
+            "prompt": "improve this builder ai so it uses the latest user request first, reduces repeated answers, and gives more specific suggestions",
+            "mode": "mutate" if has_generated_app else "evolve",
+        }
     if not has_generated_app:
         starter_prompt = {
             "assistant app": "Build a simple AI assistant with chat, saved history, and one clean workspace",
@@ -1443,7 +1475,12 @@ def build_conversational_answer(
     unresolved = list(previous_memory.get("unresolved_questions") or [])
     recent_context = summarize_recent_context(recent_messages)
 
-    if re.search(r"(conversation|chat|talk|answer|respond|question)", lowered):
+    if is_builder_ai_request(lowered):
+        answer = (
+            "If you are asking about this builder AI itself, the main fix is to make it respond to the latest request first instead of repeating old app context. "
+            "It should also separate builder-improvement advice from app-feature advice."
+        )
+    elif re.search(r"(conversation|chat|talk|answer|respond|question)", lowered):
         answer = (
             "Yes. You can talk to the builder normally. "
             "It should answer first, ask follow-up questions when needed, and only apply changes when the request is clear."
@@ -1486,6 +1523,7 @@ def build_conversational_answer(
 def build_agent_reply(payload: ChatAgentRequest) -> Dict[str, Any]:
     message = payload.message.strip()
     lowered = message.lower()
+    builder_ai_request = is_builder_ai_request(message)
     has_generated_app = bool(payload.generated_files or payload.routes or payload.components or payload.project_id)
     previous_memory = dict(payload.project_memory or {})
     decisions = infer_decisions_from_message(message, previous_memory)
@@ -1542,11 +1580,17 @@ def build_agent_reply(payload: ChatAgentRequest) -> Dict[str, Any]:
     elif is_suggestion_request(lowered):
         response_type = "suggest"
         ready_to_apply = False
-        assistant_message = (
-            f"I recommend starting with a {app_type} in {builder_mode} mode. "
-            "For v1, keep it focused: a clear homepage, one main workspace, saved data, and one useful upgrade path. "
-            "Pick a suggestion, or tell me your niche and I will shape it around that."
-        )
+        if builder_ai_request:
+            assistant_message = (
+                "The repeated answer is happening because suggestion requests are still leaning on older project context too much. "
+                "The best fixes are reacting to the latest request first, separating builder advice from app advice, and checking for likely problems before suggesting generic features."
+            )
+        else:
+            assistant_message = (
+                f"I recommend starting with a {app_type} in {builder_mode} mode. "
+                "For v1, keep it focused: a clear homepage, one main workspace, saved data, and one useful upgrade path. "
+                "Pick a suggestion, or tell me your niche and I will shape it around that."
+            )
         if knowledge_hits:
             assistant_message += f" I am also using {len(knowledge_hits)} saved knowledge item(s) from earlier research on similar topics."
     elif (is_explanation_request(lowered) or is_followup_question(message, recent_messages)) and not is_mutation_request(lowered):
@@ -1628,7 +1672,7 @@ def build_agent_reply(payload: ChatAgentRequest) -> Dict[str, Any]:
         questions = build_clarifying_questions(lowered, app_type, systems, decisions)
         assistant_message = "Tell me a bit more about the app you want, and I will shape the first version with the right layout and systems."
 
-    suggested_actions = build_suggested_actions(app_type, has_generated_app, systems, builder_mode, research_recommendation)
+    suggested_actions = build_suggested_actions(app_type, has_generated_app, systems, builder_mode, research_recommendation, message)
     next_improvement_action = build_next_improvement_action(app_type, has_generated_app, systems, builder_mode, message, previous_memory)
     followup_actions = build_followup_actions(response_type, has_generated_app)
     suggested_actions = merge_action_lists([next_improvement_action], followup_actions, suggested_actions, limit=5)
