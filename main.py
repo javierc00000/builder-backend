@@ -484,6 +484,28 @@ def normalize_reply_preference(preference: str) -> str:
     return "balanced"
 
 
+def has_strong_product_signal(message: str) -> bool:
+    return bool(re.search(r"(admin|dashboard|crm|analytics|panel|saas|assistant|chat app|copilot|agent|content|editor|blog|cms|writer|battery|solar|power|inverter|calculator|landing|marketing|website|portal)", str(message or "").lower()))
+
+
+def should_use_fresh_project_context(message: str, current_app_type: str, current_builder_mode: str) -> bool:
+    lowered = str(message or "").strip().lower()
+    if not lowered:
+        return False
+    if is_builder_ai_request(lowered):
+        return True
+    if re.search(r"(new app|new project|different app|different project|another app|another project|something else|instead of this|not this app|switch project|start over|from scratch)", lowered):
+        return True
+    inferred_app_type = infer_app_type(lowered)
+    inferred_builder_mode = infer_builder_mode(lowered)
+    if has_strong_product_signal(lowered) and (
+        (current_app_type and inferred_app_type != current_app_type)
+        or (current_builder_mode and inferred_builder_mode != current_builder_mode)
+    ):
+        return True
+    return False
+
+
 def summarize_recent_context(recent_messages: List[Dict[str, str]]) -> str:
     parts: List[str] = []
     for item in recent_messages[-4:]:
@@ -1649,9 +1671,14 @@ def build_agent_reply(payload: ChatAgentRequest) -> Dict[str, Any]:
     has_generated_app = bool(payload.generated_files or payload.routes or payload.components or payload.project_id)
     previous_memory = dict(payload.project_memory or {})
     decisions = infer_decisions_from_message(message, previous_memory)
-    app_type = payload.feature_state.get("appType") or previous_memory.get("app_type") or infer_app_type(message)
-    builder_mode = payload.feature_state.get("builderMode") or previous_memory.get("builder_mode") or infer_builder_mode(message)
-    if has_generated_app or previous_memory.get("project_summary"):
+    current_app_type = payload.feature_state.get("appType") or previous_memory.get("app_type") or ""
+    current_builder_mode = payload.feature_state.get("builderMode") or previous_memory.get("builder_mode") or ""
+    inferred_app_type = infer_app_type(message)
+    inferred_builder_mode = infer_builder_mode(message)
+    use_fresh_context = should_use_fresh_project_context(message, current_app_type, current_builder_mode)
+    app_type = inferred_app_type if use_fresh_context else (current_app_type or inferred_app_type)
+    builder_mode = inferred_builder_mode if use_fresh_context else (current_builder_mode or inferred_builder_mode)
+    if not use_fresh_context and (has_generated_app or previous_memory.get("project_summary")):
         systems = payload.system_planner.get("systems") or previous_memory.get("systems") or infer_systems(message, app_type)
     else:
         systems = infer_systems(message, app_type)
