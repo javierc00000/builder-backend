@@ -7,6 +7,27 @@ import re
 import json
 import os
 from pathlib import Path
+import threading
+
+# Path for GPT-4 logs
+GPT4_LOG_PATH = "gpt4_logs.jsonl"
+
+def log_gpt4_response(prompt: str, response: str, ai_mode: str, user_id: str = None, extra: dict = None):
+    """Append a GPT-4 prompt/response pair to the log file."""
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "prompt": prompt,
+        "response": response,
+        "ai_mode": ai_mode,
+        "user_id": user_id,
+    }
+    if extra:
+        entry.update(extra)
+    # Write asynchronously to avoid blocking
+    def write_log():
+        with open(GPT4_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    threading.Thread(target=write_log, daemon=True).start()
 
 try:
     from duckduckgo_search import DDGS
@@ -23,6 +44,8 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
         "https://builder-frontend.javierc00000.workers.dev",
     ],
     allow_credentials=True,
@@ -97,6 +120,10 @@ def list_project_states(limit: int = 20):
         "items": items[:capped],
     }
 
+
+# Correct route registration for PUT endpoint
+class ProjectStateRequest(BaseModel):
+    snapshot: Dict[str, Any] = Field(default_factory=dict)
 
 @app.put("/project-state/{project_id}")
 def put_project_state(project_id: str, payload: ProjectStateRequest):
@@ -214,8 +241,6 @@ class WorkspaceEditRequest(RepoEditRequest):
     workspace_subdir: str = ""
 
 
-class ProjectStateRequest(BaseModel):
-    snapshot: Dict[str, Any] = Field(default_factory=dict)
 
 class RvMonetizationRequest(BaseModel):
     template_key: str = "rv_power"
@@ -396,6 +421,33 @@ def battery_plan(payload: BatteryPlanRequest):
         "solar_watts": solar_watts,
         "summary": f"For this setup, plan for about {battery_ah}Ah of battery and {solar_watts}W of solar.",
     }
+
+
+# Endpoint to trigger learning from GPT-4 logs
+@app.post("/learn-from-gpt")
+async def learn_from_gpt():
+    """
+    Reads GPT-4 logs and (example) updates local AI rules/knowledge.
+    For demo: returns a summary of unique prompts and responses.
+    """
+    try:
+        with open(GPT4_LOG_PATH, "r", encoding="utf-8") as f:
+            entries = [json.loads(line) for line in f if line.strip()]
+    except FileNotFoundError:
+        return {"ok": False, "error": "No GPT-4 logs found."}
+
+    # Example: summarize unique prompt/response pairs
+    seen = set()
+    summary = []
+    for entry in entries:
+        key = (entry["prompt"].strip(), entry["response"].strip())
+        if key not in seen:
+            seen.add(key)
+            summary.append({"prompt": entry["prompt"], "response": entry["response"]})
+
+    # Here you could update local rules/knowledge base
+    # For now, just return the summary
+    return {"ok": True, "examples": summary[:20], "count": len(summary)}
 
 
 def infer_app_type(prompt: str) -> str:
@@ -1899,6 +1951,16 @@ def build_agent_reply(payload: ChatAgentRequest) -> Dict[str, Any]:
     project_memory = build_project_memory(payload, app_type, builder_mode, systems, has_generated_app, questions, suggested_actions, research)
     advice = project_memory.get("advice") or {"upgrades": [], "cautions": [], "better_options": []}
 
+    # Log GPT-4 responses automatically
+    ai_mode = getattr(payload, "ai_mode", "my-ai")
+    if ai_mode == "gpt-4":
+        log_gpt4_response(
+            prompt=payload.message,
+            response=assistant_message,
+            ai_mode=ai_mode,
+            user_id=getattr(payload, "user_id", None),
+            extra={"project_id": getattr(payload, "project_id", None)}
+        )
     return {
         "ok": True,
         "response_type": response_type,
@@ -3372,3 +3434,142 @@ def workspace_edit(payload: WorkspaceEditRequest):
 @app.post("/chat-agent")
 def chat_agent(payload: ChatAgentRequest):
     return build_agent_reply(payload)
+
+
+# Models endpoint for frontend selector
+@app.get("/models")
+def get_models():
+    return {
+        "models": [
+            "auto",
+            "gpt-4.1",
+            "gpt-4o-mini",
+            "gpt-5.4",
+            "claude-sonnet-4.6",
+            "claude-opus-4.6",
+        ]
+    }
+
+
+# 🧠 Smart AUTO model selection
+def select_model_auto(prompt: str):
+    p = prompt.lower()
+
+    # simple heuristic routing
+    if any(k in p for k in ["quick", "simple", "fast"]):
+        return "gpt-4.1"
+
+    if any(k in p for k in ["code", "debug", "fix", "error"]):
+        return "claude-sonnet-4.6"
+
+    if any(k in p for k in ["complex", "architecture", "system", "builder"]):
+        return "gpt-5.4"
+
+    # fallback strongest
+    return "claude-opus-4.6"
+
+
+# 🔁 Retry + Escalation System
+def run_with_retry(prompt: str, call_model_fn):
+    model_chain = [
+        "gpt-4.1",
+        "claude-sonnet-4.6",
+        "gpt-5.4",
+        "claude-opus-4.6"
+    ]
+
+    last_error = None
+
+    for model in model_chain:
+        try:
+            response = call_model_fn(prompt, model)
+
+            # simple quality check
+            if response and len(str(response)) > 20:
+                return {
+                    "model_used": model,
+                    "response": response,
+                    "status": "success"
+                }
+
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+    return {
+        "model_used": "none",
+        "response": None,
+        "status": "failed",
+        "error": last_error
+    }
+
+
+# 🧠 Quality Scoring
+def score_response_quality(response: str):
+    if not response:
+        return 0.0
+
+    length = len(str(response))
+
+    score = 0.0
+
+    if length > 50:
+        score += 0.3
+    if length > 150:
+        score += 0.3
+    if any(k in str(response).lower() for k in ["error", "fix", "solution", "steps"]):
+        score += 0.2
+    if "```" in str(response):
+        score += 0.2
+
+    return min(score, 1.0)
+
+
+# 🔁 Self-correction loop
+def run_with_quality_control(prompt: str, call_model_fn):
+    model_chain = [
+        "gpt-4.1",
+        "claude-sonnet-4.6",
+        "gpt-5.4",
+        "claude-opus-4.6"
+    ]
+
+    last_response = None
+
+    for model in model_chain:
+        try:
+            response = call_model_fn(prompt, model)
+            quality = score_response_quality(response)
+
+            if quality >= 0.7:
+                return {
+                    "model_used": model,
+                    "response": response,
+                    "quality": quality,
+                    "status": "accepted"
+                }
+
+            # self-correct attempt
+            improved_prompt = prompt + f"\n\nImprove this answer:\n{response}"
+            improved_response = call_model_fn(improved_prompt, model)
+            improved_quality = score_response_quality(improved_response)
+
+            if improved_quality > quality:
+                return {
+                    "model_used": model,
+                    "response": improved_response,
+                    "quality": improved_quality,
+                    "status": "improved"
+                }
+
+            last_response = response
+
+        except Exception:
+            continue
+
+    return {
+        "model_used": "fallback",
+        "response": last_response,
+        "quality": score_response_quality(last_response),
+        "status": "fallback"
+    }
